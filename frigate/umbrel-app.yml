@@ -1,7 +1,7 @@
 manifestVersion: 1.1
-id: frigate
+id: frigate-silent-payments
 category: bitcoin
-name: Frigate
+name: Frigate (Silent Payments)
 version: 1.5.3
 tagline: Electrum server for Silent Payments
 description: >
