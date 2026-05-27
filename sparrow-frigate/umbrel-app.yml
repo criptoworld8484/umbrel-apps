@@ -2,25 +2,22 @@ manifestVersion: 1
 id: sparrow-frigate
 category: bitcoin
 name: Frigate (Silent Payments)
-version: 1.5.3
-tagline: Electrum server for Silent Payments
-description: >
+version: "1.5.2"
+tagline: Electrum server for Silent Payments (BIP352)
+icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-frigate/icon.svg
+description: >-
   Frigate is an Electrum server for Silent Payments (BIP352). It performs
-  Silent Payments scanning server-side using ephemeral client keys, returning
-  discovered transactions to clients over an extension to the Electrum JSON-RPC
-  protocol.
-
+  Silent Payments scanning server-side using ephemeral client keys.
   This package is configured for Bitcoin testnet4.
-developer: sparrowwallet
+developer: Sparrow Wallet
 website: https://github.com/sparrowwallet/frigate
 repo: https://github.com/sparrowwallet/frigate
-support: https://github.com/sparrowwallet/frigate/discussions
+support: https://github.com/sparrowwallet/frigate/issues
 port: 3005
 gallery: []
-path: ""
-defaultPassword: ""
-dependencies: []
-releaseNotes: >
+releaseNotes: >-
   Initial release for Umbrel with testnet4 support.
-submitter: community
-submission: https://github.com/getumbrel/umbrel-apps
+dependencies: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""

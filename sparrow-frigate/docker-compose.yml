@@ -5,18 +5,14 @@ services:
     environment:
       APP_HOST: sparrow-frigate_frigate_1
       APP_PORT: 3005
-      PROXY_AUTH_ADD: "false"
 
   frigate:
     image: ghcr.io/criptoworld8484/frigate-umbrel/frigate-umbrel:latest
     init: true
     restart: on-failure
-    stop_grace_period: 5m
-    ports:
-      - "50001:50001"
-      - "50002:50002"
+    stop_grace_period: 1m
     volumes:
-      - "${APP_DATA_DIR}/data/frigate:/data"
+      - ${APP_DATA_DIR}/data:/data
     environment:
       FRIGATE_HOME: /data
       FRIGATE_NETWORK: testnet4
