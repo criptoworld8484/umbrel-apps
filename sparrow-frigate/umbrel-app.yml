@@ -1,5 +1,5 @@
 manifestVersion: 1
-id: frigate-silent-payments
+id: sparrow-frigate
 category: bitcoin
 name: Frigate (Silent Payments)
 version: 1.5.3

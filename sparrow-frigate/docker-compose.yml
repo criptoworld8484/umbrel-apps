@@ -3,7 +3,7 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      APP_HOST: frigate-silent-payments_frigate_1
+      APP_HOST: sparrow-frigate_frigate_1
       APP_PORT: 3005
       PROXY_AUTH_ADD: "false"
 
