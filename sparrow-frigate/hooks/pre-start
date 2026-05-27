@@ -1,5 +1,0 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-Frigate startup for Umbrel
-Creates config directory and generates SSL certificates if needed

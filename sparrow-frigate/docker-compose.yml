@@ -8,7 +8,7 @@ services:
       PROXY_AUTH_ADD: "false"
 
   frigate:
-    image: ghcr.io/criptoworld8484/frigate-umbrel/frigate-umbrel:latest@sha256:af2fcae1761c4b3a031c0f33aaa1f11653e39e577ec1c1b87f58329ee926d1b1
+    image: ghcr.io/criptoworld8484/frigate-umbrel/frigate-umbrel:latest
     init: true
     restart: on-failure
     stop_grace_period: 5m
@@ -25,7 +25,7 @@ services:
         ipv4_address: $APP_FRIGATE_IP
 
   tor:
-    image: getumbrel/tor:0.4.7.8@sha256:2ace83f22501f58857fa9b403009f595137fa2e7986c4fda79d82a8119072b6a
+    image: getumbrel/tor:0.4.7.8
     user: "1000:1000"
     restart: on-failure
     volumes:
