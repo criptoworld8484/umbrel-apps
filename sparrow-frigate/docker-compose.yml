@@ -4,15 +4,24 @@ services:
   app_proxy:
     environment:
       APP_HOST: sparrow-frigate_frigate_1
-      APP_PORT: 3005
+      APP_PORT: 50001
 
   frigate:
     image: ghcr.io/criptoworld8484/frigate-umbrel/frigate-umbrel:latest
     init: true
     restart: on-failure
     stop_grace_period: 1m
+    ports:
+      - "50001:50001"
+      - "50002:50002"
     volumes:
       - ${APP_DATA_DIR}/data:/data
+      - ${APP_BITCOIN_DATA_DIR}:/bitcoin:ro
     environment:
       FRIGATE_HOME: /data
       FRIGATE_NETWORK: testnet4
+      BITCOIN_RPC_HOST: "${APP_BITCOIN_NODE_IP}"
+      BITCOIN_RPC_PORT: "${APP_BITCOIN_RPC_PORT}"
+      BITCOIN_RPC_USER: "${APP_BITCOIN_RPC_USER}"
+      BITCOIN_RPC_PASS: "${APP_BITCOIN_RPC_PASS}"
+      ZMQ_SEQUENCE_ENDPOINT: "tcp://${APP_BITCOIN_NODE_IP}:28336"
