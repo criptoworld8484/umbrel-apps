@@ -1,3 +1,0 @@
-# pinserver Hidden Service
-HiddenServiceDir /data/app-$APP_ID-node
-HiddenServicePort $APP_PINSERVER_PORT blockstream-blind-oracle_node_1:8096
