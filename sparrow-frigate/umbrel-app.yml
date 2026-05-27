@@ -13,7 +13,7 @@ developer: Sparrow Wallet
 website: https://github.com/sparrowwallet/frigate
 repo: https://github.com/sparrowwallet/frigate
 support: https://github.com/sparrowwallet/frigate/issues
-port: 50001
+port: 51001
 gallery: []
 releaseNotes: >-
   Initial release for Umbrel with testnet4 support.
