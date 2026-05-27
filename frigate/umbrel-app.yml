@@ -1,58 +1,33 @@
-manifestVersion: 1
+manifestVersion: 1.1
 id: frigate
-category: automation
+category: bitcoin
 name: Frigate
-version: "0.17.1"
-tagline: A complete and local NVR
-description: >-
-  A complete and local NVR designed for Home Assistant with AI object detection. 
-  Uses OpenCV and Tensorflow to perform realtime object detection locally for IP cameras.
+version: 1.5.3
+tagline: Electrum server for Silent Payments
+description: >
+  Frigate is an Electrum server for Silent Payments (BIP352). It performs
+  Silent Payments scanning server-side using ephemeral client keys, returning
+  discovered transactions to clients over an extension to the Electrum JSON-RPC
+  protocol.
 
+  This package is configured for Bitcoin testnet4.
 
-  🛠️ SET-UP
-
-
-  - You can configure your cameras directly within the Frigate app, there is no need to manually edit the configuration files.
-
-
-  - Your RTSP password (if needed) is the "default app password" that is displayed on Frigate's page in the app store (shown after install).
-releaseNotes: >-
-  ⚠️ As usual, Frigate will attempt to update its configuration automatically. It is still recommended to back up your current config and database before upgrading.
-
-
-  🚨 This is a maintenance release with security fixes and bugfixes:
-    - Restricted raw config endpoint to admin role only
-    - Fixed cross-camera authentication in timeline and media endpoints
-    - Fixed RKNN ArcFace input format
-    - Fixed storage cleanup being attempted when Frigate is in safe mode
-
-
-  Other improvements in this update include:
-    - Improved playback of videos in Tracking Details
-    - Fixed preview retrieval to handle missing previews gracefully
-    - Fixed thumbnail encoding logic
-    - Fixed go2rtc config handling
-    - Fixed GenAI issues
-    - Fixed audio event maintainer
-    - Push notifications now filtered by user role camera access
-    - Various UI fixes and improvements
-
-
-  Full release notes are available at https://github.com/blakeblackshear/frigate/releases
-developer: Blake Blackshear
-website: https://frigate.video/
-repo: https://github.com/blakeblackshear/frigate
-support: https://github.com/blakeblackshear/frigate/issues
-port: 5004
-gallery:
-  - 1.jpg
-  - 2.jpg
-  - 3.jpg
+  Note: This is the Sparrow Wallet implementation of the Electrum server for
+  Silent Payments, not to be confused with the home security NVR software
+  also called Frigate.
+developer: sparrowwallet
+website: https://github.com/sparrowwallet/frigate
+repo: https://github.com/sparrowwallet/frigate
+support: https://github.com/sparrowwallet/frigate/discussions
+port: 5005
+gallery: []
 path: ""
-defaultUsername: ""
-deterministicPassword: true
-dependencies: []
-permissions:
-  - GPU
-submitter: ~dibref-labter
-submission: https://github.com/getumbrel/umbrel-apps/pull/843
+defaultPassword: ""
+dependencies:
+  - bitcoin
+releaseNotes: >
+  Initial release for Umbrel with testnet4 support.
+  Frigate is an Electrum server for Silent Payments (BIP352) supporting
+  GPU-accelerated scanning with CUDA, Metal, and OpenCL backends.
+submitter: community
+submission: https://github.com/getumbrel/umbrel-apps
