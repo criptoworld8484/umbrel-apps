@@ -17,8 +17,7 @@ port: 51001
 gallery: []
 releaseNotes: >-
   Initial release for Umbrel with testnet4 support.
-dependencies:
-  - bitcoin
+dependencies: []
 path: ""
 defaultUsername: ""
 defaultPassword: ""
