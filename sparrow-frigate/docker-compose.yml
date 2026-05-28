@@ -3,19 +3,37 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      APP_HOST: sparrow-frigate_frigate_1
-      APP_PORT: 50001
+      APP_HOST: sparrow-frigate_server_1
+      APP_PORT: 57001
 
-  frigate:
-    image: ghcr.io/criptoworld8484/frigate-umbrel/frigate-umbrel:latest
-    init: true
-    restart: on-failure
-    stop_grace_period: 1m
-    ports:
-      - "51001:50001"
-      - "51002:50002"
+  init:
+    image: alpine:3.20
+    user: "0:0"
+    restart: "no"
     volumes:
       - ${APP_DATA_DIR}/data:/data
+    command: ["sh", "-c", "mkdir -p /data/frigate && chown -R 1000:1000 /data && chmod 755 /data"]
+
+  server:
+    image: ghcr.io/criptoworld8484/frigate-umbrel/frigate-umbrel:latest
+    user: "1000:1000"
+    restart: on-failure
+    stop_grace_period: 1m
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    ports:
+      - "57001:57001"
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+      - ${APP_BITCOIN_DATA_DIR}:/data/.bitcoin:ro
     environment:
-      FRIGATE_HOME: /data
+      APP_BITCOIN_NODE_IP: "${APP_BITCOIN_NODE_IP}"
+      APP_BITCOIN_RPC_PORT: "${APP_BITCOIN_RPC_PORT}"
+      APP_BITCOIN_RPC_USER: "${APP_BITCOIN_RPC_USER}"
+      APP_BITCOIN_RPC_PASS: "${APP_BITCOIN_RPC_PASS}"
+      APP_BITCOIN_ZMQ_SEQUENCE_PORT: "${APP_BITCOIN_ZMQ_SEQUENCE_PORT}"
+      FRIGATE_BITCOIN_DATA_DIR: "/data/.bitcoin"
       FRIGATE_NETWORK: testnet4
+      FRIGATE_COMPUTE_BACKEND: "CPU"
+      FRIGATE_PORT: "57001"
