@@ -4,8 +4,9 @@ set -eu
 EXPECTED_NETWORK="${FRIGATE_NETWORK:-signet}"
 
 if [ -n "${APP_BITCOIN_NETWORK:-}" ] && [ "${APP_BITCOIN_NETWORK}" != "${EXPECTED_NETWORK}" ]; then
-  echo "WARN (sparrow-frigate): Bitcoin está en '${APP_BITCOIN_NETWORK}', se esperaba '${EXPECTED_NETWORK}'."
-  echo "WARN: Ajusta Bitcoin Node a Signet y reinicia umbrelOS para evitar errores de indexación."
+  echo "ERROR (sparrow-frigate): Bitcoin está en '${APP_BITCOIN_NETWORK}', se requiere '${EXPECTED_NETWORK}'."
+  echo "ERROR: En Bitcoin Node → Advanced → Signet, reinicia Bitcoin y luego esta app."
+  exit 1
 fi
 
 echo "sparrow-frigate pre-start OK (bitcoin network: ${APP_BITCOIN_NETWORK:-unknown})."

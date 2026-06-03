@@ -33,7 +33,7 @@ services:
       default:
 
   frigate:
-    image: ghcr.io/criptoworld8484/frigate-umbrel-web:frigate-1.5.7
+    image: ghcr.io/criptoworld8484/frigate-umbrel-web:frigate-1.5.9
     restart: on-failure
     stop_grace_period: 5m
     user: "1000:1000"
