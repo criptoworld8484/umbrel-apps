@@ -4,13 +4,14 @@ ARG FRIGATE_VERSION=1.5.3
 ARG TARGETARCH
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends \
+      ca-certificates curl nginx gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
     case "${TARGETARCH}" in \
-      amd64) ARCH=x86_64; DEB_ARCH=amd64 ;; \
-      arm64) ARCH=aarch64; DEB_ARCH=arm64 ;; \
+      amd64) ARCH=x86_64 ;; \
+      arm64) ARCH=aarch64 ;; \
       *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/frigate.tar.gz \
@@ -19,10 +20,15 @@ RUN set -eux; \
     rm -f /tmp/frigate.tar.gz
 
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY start-all.sh /start-all.sh
+COPY web/nginx.conf /etc/nginx/conf.d/default.conf
+COPY web/index.html /usr/share/nginx/html/index.html
+RUN chmod +x /entrypoint.sh /start-all.sh \
+    && mkdir -p /var/log/nginx /var/lib/nginx /run/nginx \
+    && chown -R 1000:1000 /var/log/nginx /var/lib/nginx /run/nginx /etc/nginx
 
 USER 1000
 WORKDIR /data
-EXPOSE 50002
+EXPOSE 3006 50002
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/start-all.sh"]

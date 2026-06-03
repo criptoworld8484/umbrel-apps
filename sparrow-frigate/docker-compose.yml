@@ -3,8 +3,7 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      # Nombre fijado por umbrelOS en patchComposeFile: <app-id>_<service>_1
-      APP_HOST: sparrow-frigate_web_1
+      APP_HOST: sparrow-frigate_server_1
       APP_PORT: 3006
 
   init:
@@ -21,17 +20,8 @@ services:
         chown -R 1000:1000 /data
         chmod 755 /data
 
-  web:
-    image: ghcr.io/criptoworld8484/frigate-umbrel-web:1.5.3
-    restart: on-failure
-    depends_on:
-      init:
-        condition: service_completed_successfully
-    networks:
-      default:
-
-  frigate:
-    image: ghcr.io/criptoworld8484/frigate-umbrel:1.5.3
+  server:
+    image: ghcr.io/criptoworld8484/frigate-umbrel-web:1.5.5
     restart: on-failure
     stop_grace_period: 5m
     user: "1000:1000"
