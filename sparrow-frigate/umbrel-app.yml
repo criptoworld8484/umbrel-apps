@@ -2,7 +2,7 @@ manifestVersion: 1.1.0
 id: sparrow-frigate
 category: bitcoin
 name: Frigate (Silent Payments)
-version: "1.5.5"
+version: "1.5.6"
 tagline: Electrum server for Silent Payments (BIP352) on Signet
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-frigate/icon.png
 description: >-
@@ -23,7 +23,7 @@ path: ""
 defaultUsername: ""
 defaultPassword: ""
 releaseNotes: >-
-  Imagen unificada (Frigate + UI), Signet, Electrs, puertos 3006/50002, icon.png.
+  Corrige nginx sin root (UI en :3006). Signet, Electrs, Electrum :50002.
 submitter: criptoworld8484
 submission: https://github.com/criptoworld8484/umbrel-apps
 backupIgnore:

@@ -21,11 +21,12 @@ RUN set -eux; \
 
 COPY entrypoint.sh /entrypoint.sh
 COPY start-all.sh /start-all.sh
+COPY nginx-umbrel.conf /etc/nginx/nginx-umbrel.conf
 COPY web/nginx.conf /etc/nginx/conf.d/default.conf
 COPY web/index.html /usr/share/nginx/html/index.html
 RUN chmod +x /entrypoint.sh /start-all.sh \
-    && mkdir -p /var/log/nginx /var/lib/nginx /run/nginx \
-    && chown -R 1000:1000 /var/log/nginx /var/lib/nginx /run/nginx /etc/nginx
+    && mkdir -p /tmp/nginx /var/cache/nginx \
+    && chown -R 1000:1000 /tmp/nginx /var/cache/nginx /etc/nginx
 
 USER 1000
 WORKDIR /data

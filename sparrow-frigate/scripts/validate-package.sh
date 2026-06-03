@@ -11,6 +11,7 @@ required=(
   Dockerfile
   entrypoint.sh
   start-all.sh
+  nginx-umbrel.conf
   icon.png
   web/index.html
   web/nginx.conf
