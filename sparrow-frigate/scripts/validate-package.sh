@@ -10,8 +10,6 @@ required=(
   exports.sh
   Dockerfile
   entrypoint.sh
-  start-all.sh
-  nginx-umbrel.conf
   icon.png
   web/index.html
   web/nginx.conf
@@ -22,11 +20,11 @@ for f in "${required[@]}"; do
   [[ -e "${f}" ]] || { echo "MISSING: ${f}" >&2; exit 1; }
 done
 
-grep -q 'sparrow-frigate_server_1' docker-compose.yml
-grep -q 'ghcr.io/criptoworld8484/frigate-umbrel-web' docker-compose.yml
+grep -q 'sparrow-frigate_web_1' docker-compose.yml
+grep -q 'nginx:1.27-alpine' docker-compose.yml
+grep -q 'frigate-umbrel-web:frigate-' docker-compose.yml
 grep -q 'icon.png' umbrel-app.yml
 bash -n entrypoint.sh
-bash -n start-all.sh
 bash -n hooks/pre-start
 
 echo "Package validation passed."

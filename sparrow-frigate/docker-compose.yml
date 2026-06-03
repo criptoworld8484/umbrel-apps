@@ -3,7 +3,7 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      APP_HOST: sparrow-frigate_server_1
+      APP_HOST: sparrow-frigate_web_1
       APP_PORT: 3006
 
   init:
@@ -20,8 +20,20 @@ services:
         chown -R 1000:1000 /data
         chmod 755 /data
 
-  server:
-    image: ghcr.io/criptoworld8484/frigate-umbrel-web:1.5.6
+  web:
+    image: nginx:1.27-alpine
+    restart: on-failure
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    volumes:
+      - ${APP_DATA_DIR}/web:/usr/share/nginx/html:ro
+      - ${APP_DATA_DIR}/web/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      default:
+
+  frigate:
+    image: ghcr.io/criptoworld8484/frigate-umbrel-web:frigate-1.5.7
     restart: on-failure
     stop_grace_period: 5m
     user: "1000:1000"

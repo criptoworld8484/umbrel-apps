@@ -11,7 +11,7 @@ permissions:
   packages: write
 
 jobs:
-  build:
+  build-frigate:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -30,7 +30,7 @@ jobs:
           if [ "${{ github.ref_type }}" = "tag" ]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=1.5.4" >> "$GITHUB_OUTPUT"
+            echo "version=1.5.7" >> "$GITHUB_OUTPUT"
           fi
       - uses: docker/build-push-action@v6
         with:
@@ -40,5 +40,5 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ghcr.io/criptoworld8484/frigate-umbrel-web:${{ steps.ver.outputs.version }}
-            ghcr.io/criptoworld8484/frigate-umbrel-web:latest
+            ghcr.io/criptoworld8484/frigate-umbrel-web:frigate-${{ steps.ver.outputs.version }}
+            ghcr.io/criptoworld8484/frigate-umbrel-web:frigate-latest

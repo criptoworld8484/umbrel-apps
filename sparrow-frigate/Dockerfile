@@ -4,8 +4,7 @@ ARG FRIGATE_VERSION=1.5.3
 ARG TARGETARCH
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-      ca-certificates curl nginx gettext-base \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
@@ -20,16 +19,10 @@ RUN set -eux; \
     rm -f /tmp/frigate.tar.gz
 
 COPY entrypoint.sh /entrypoint.sh
-COPY start-all.sh /start-all.sh
-COPY nginx-umbrel.conf /etc/nginx/nginx-umbrel.conf
-COPY web/nginx.conf /etc/nginx/conf.d/default.conf
-COPY web/index.html /usr/share/nginx/html/index.html
-RUN chmod +x /entrypoint.sh /start-all.sh \
-    && mkdir -p /tmp/nginx /var/cache/nginx \
-    && chown -R 1000:1000 /tmp/nginx /var/cache/nginx /etc/nginx
+RUN chmod +x /entrypoint.sh
 
 USER 1000
 WORKDIR /data
-EXPOSE 3006 50002
+EXPOSE 50002
 
-ENTRYPOINT ["/start-all.sh"]
+ENTRYPOINT ["/entrypoint.sh"]
