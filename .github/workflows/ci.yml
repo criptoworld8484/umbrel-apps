@@ -1,0 +1,27 @@
+name: Validate Umbrel store
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check umbrel-app-store.yml
+        run: test -f umbrel-app-store.yml && grep -q '^id: "sparrow"' umbrel-app-store.yml
+
+      - name: Validate sparrow-frigate package
+        run: bash sparrow-frigate/scripts/validate-package.sh
+
+      - name: Parse docker-compose.yml
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('sparrow-frigate/docker-compose.yml'))"
+
+      - name: Parse umbrel-app.yml
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('sparrow-frigate/umbrel-app.yml'))"

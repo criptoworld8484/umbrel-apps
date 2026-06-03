@@ -1,25 +1,31 @@
-manifestVersion: 1
+manifestVersion: 1.1.0
 id: sparrow-frigate
 category: bitcoin
 name: Frigate (Silent Payments)
-version: "1.5.2"
-tagline: Silent Payments Electrum server for Sparrow Wallet
+version: "1.5.3"
+tagline: Electrum server for Silent Payments (BIP352) on Signet
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-frigate/icon.png
 description: >-
-  Frigate is an Electrum server for Silent Payments (BIP352). It performs
-  Silent Payments scanning server-side using ephemeral client keys.
+  Frigate indexa y escanea Silent Payments en el servidor (BIP352). Para
+  Signet: Bitcoin Core con txindex=1 y Electrs instalados.
 
-  This package is configured for Bitcoin testnet4.
-  Requires Bitcoin Node installed and synced on testnet4.
-developer: sparrowwallet
+  Sparrow: servidor Electrum privado, host de tu Umbrel, puerto 50002, sin SSL.
+developer: Sparrow Wallet
 website: https://github.com/sparrowwallet/frigate
+dependencies:
+  - bitcoin
+  - electrs
 repo: https://github.com/sparrowwallet/frigate
-support: https://github.com/semillabitcoin/frigate-umbrel/issues
-port: 57001
+support: https://github.com/criptoworld8484/frigate-umbrel/issues
+port: 3006
 gallery: []
-releaseNotes: >-
-  Initial Umbrel release for testnet4.
-dependencies: []
 path: ""
 defaultUsername: ""
 defaultPassword: ""
+releaseNotes: >-
+  Corrige icono y arranque: UI web en puerto 3006, Electrum en 50002, entrypoint
+  reparado, imágenes GHCR separadas (frigate + web).
+submitter: criptoworld8484
+submission: https://github.com/criptoworld8484/umbrel-apps
+backupIgnore:
+  - data/signet/db

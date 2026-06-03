@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+EXPECTED_NETWORK="${FRIGATE_NETWORK:-signet}"
+
+if [ -n "${APP_BITCOIN_NETWORK:-}" ] && [ "${APP_BITCOIN_NETWORK}" != "${EXPECTED_NETWORK}" ]; then
+  echo "WARN (sparrow-frigate): Bitcoin está en '${APP_BITCOIN_NETWORK}', se esperaba '${EXPECTED_NETWORK}'."
+  echo "WARN: Ajusta Bitcoin Node a Signet y reinicia umbrelOS para evitar errores de indexación."
+fi
+
+echo "sparrow-frigate pre-start OK (bitcoin network: ${APP_BITCOIN_NETWORK:-unknown})."

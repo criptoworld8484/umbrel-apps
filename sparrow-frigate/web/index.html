@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Frigate — Silent Payments (Signet)</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --accent: #3d8bfd;
+      --warn: #e6a23c;
+      --ok: #3dd68c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 2rem 1.5rem;
+      line-height: 1.55;
+      max-width: 52rem;
+      margin-inline: auto;
+    }
+    h1 { font-size: 1.75rem; font-weight: 600; margin: 0 0 0.25rem; }
+    .tagline { color: var(--muted); margin: 0 0 2rem; }
+    section {
+      background: var(--card);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1.25rem;
+    }
+    h2 { font-size: 1rem; margin: 0 0 0.75rem; color: var(--accent); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.5rem 0; border-bottom: 1px solid #2a3548; }
+    th { color: var(--muted); font-weight: 500; width: 38%; }
+    code {
+      background: #0d1117;
+      padding: 0.15rem 0.45rem;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+    ul { margin: 0.5rem 0 0; padding-left: 1.25rem; }
+    li { margin: 0.35rem 0; }
+    .status { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.85rem; }
+    .status-pending { background: #3a3020; color: var(--warn); }
+    a { color: var(--accent); }
+    .note { color: var(--muted); font-size: 0.9rem; margin-top: 0.75rem; }
+  </style>
+</head>
+<body>
+  <h1>Frigate Electrum Server</h1>
+  <p class="tagline">sparrow-frigate — Silent Payments (BIP352) en Signet</p>
+
+  <section>
+    <h2>Conexión Sparrow</h2>
+    <table>
+      <tr><th>Host</th><td><code id="host">umbrel.local</code></td></tr>
+      <tr><th>Puerto Electrum</th><td><code>50002</code></td></tr>
+      <tr><th>SSL</th><td>Desactivado (red local)</td></tr>
+      <tr><th>Red</th><td>Signet</td></tr>
+      <tr><th>Estado del servidor</th><td><span class="status status-pending" id="ready">Indexando o iniciando…</span></td></tr>
+    </table>
+    <p class="note">En los logs del contenedor <code>frigate</code> busca: <code>Electrum server listening on tcp://…</code></p>
+  </section>
+
+  <section>
+    <h2>Requisitos del nodo</h2>
+    <ul>
+      <li>Bitcoin Core en <strong>Signet</strong> con <code>txindex=1</code></li>
+      <li>Electrs sincronizado (backend en puerto 50001)</li>
+      <li>ZMQ <code>sequence</code> publicado por bitcoind (puerto 28335 en Umbrel)</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Privacidad</h2>
+    <p>Frigate escanea Silent Payments en el servidor con claves efímeras (no persistidas). Usa solo en tu LAN de confianza.</p>
+  </section>
+
+  <section>
+    <h2>Prueba con CLI</h2>
+    <pre><code>docker exec -it $(docker ps -qf name=frigate_frigate) \
+  /opt/frigate/bin/frigate-cli -n signet -h 127.0.0.1:50002 \
+  -s &lt;SCAN_KEY&gt; -S &lt;SPEND_PUBKEY&gt; -b &lt;altura&gt;</code></pre>
+  </section>
+
+  <section>
+    <h2>Enlaces</h2>
+    <ul>
+      <li><a href="https://github.com/sparrowwallet/frigate" target="_blank" rel="noopener">Proyecto Frigate</a></li>
+      <li><a href="https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki" target="_blank" rel="noopener">BIP-352 Silent Payments</a></li>
+    </ul>
+  </section>
+
+  <script>
+    (function () {
+      var h = location.hostname;
+      if (h) document.getElementById("host").textContent = h;
+      fetch("/health").then(function (r) {
+        if (r.ok) document.getElementById("ready").textContent = "Web UI activa — revisa logs de Frigate para Electrum";
+      }).catch(function () {});
+    })();
+  </script>
+</body>
+</html>
