@@ -1,7 +1,8 @@
-web
 hooks
 umbrel-app.yml
 exports.sh
 docker-compose.yml
+icon.png
 icon.svg
+scripts
 README.md

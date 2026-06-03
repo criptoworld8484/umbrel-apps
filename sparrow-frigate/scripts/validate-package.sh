@@ -12,7 +12,7 @@ required=(
   Dockerfile
   Dockerfile.web
   entrypoint.sh
-  icon.svg
+  icon.png
   web/index.html
   web/nginx.conf
   hooks/pre-start
@@ -30,7 +30,7 @@ grep -q 'ghcr.io/criptoworld8484/frigate-umbrel-web' docker-compose.yml
 grep -q '50002:50002' docker-compose.yml
 grep -q 'id: sparrow-frigate' umbrel-app.yml
 grep -q 'port: 3006' umbrel-app.yml
-grep -q 'icon.svg' umbrel-app.yml
+grep -q 'icon.png' umbrel-app.yml
 ! grep -q 'sparrow-frigate_server_1' docker-compose.yml
 ! grep -q '57001' docker-compose.yml
 

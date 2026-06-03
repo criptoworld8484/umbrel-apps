@@ -9,10 +9,17 @@ on:
 permissions:
   contents: read
   packages: write
+  attestations: write
+  id-token: write
 
 jobs:
   build-frigate:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -35,12 +42,18 @@ jobs:
           file: ./sparrow-frigate/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          provenance: false
           tags: |
             ghcr.io/criptoworld8484/frigate-umbrel:${{ steps.ver.outputs.version }}
             ghcr.io/criptoworld8484/frigate-umbrel:latest
 
   build-web:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -63,6 +76,7 @@ jobs:
           file: ./sparrow-frigate/Dockerfile.web
           platforms: linux/amd64,linux/arm64
           push: true
+          provenance: false
           tags: |
             ghcr.io/criptoworld8484/frigate-umbrel-web:${{ steps.ver.outputs.version }}
             ghcr.io/criptoworld8484/frigate-umbrel-web:latest

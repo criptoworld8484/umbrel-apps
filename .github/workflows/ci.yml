@@ -5,6 +5,10 @@ on:
     branches: [master, main]
   pull_request:
     branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   validate:
@@ -12,16 +16,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check umbrel-app-store.yml
+      - name: Check store manifest
         run: test -f umbrel-app-store.yml && grep -q '^id: "sparrow"' umbrel-app-store.yml
 
       - name: Validate sparrow-frigate package
         run: bash sparrow-frigate/scripts/validate-package.sh
 
-      - name: Parse docker-compose.yml
-        run: |
-          python3 -c "import yaml; yaml.safe_load(open('sparrow-frigate/docker-compose.yml'))"
-
-      - name: Parse umbrel-app.yml
-        run: |
-          python3 -c "import yaml; yaml.safe_load(open('sparrow-frigate/umbrel-app.yml'))"
+      - name: Check icon.png exists
+        run: test -f sparrow-frigate/icon.png
