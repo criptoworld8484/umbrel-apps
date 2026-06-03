@@ -65,5 +65,8 @@ EOF
   echo "Wrote ${CONFIG_FILE}"
 fi
 
-echo "Starting Frigate network=${NETWORK} port=${ELECTRUM_PORT}"
+echo "Starting Frigate network=${NETWORK} client_port=${ELECTRUM_PORT}"
+if [ -n "${APP_ELECTRS_NODE_IP:-}" ] && [ -n "${APP_ELECTRS_NODE_PORT:-}" ]; then
+  echo "Electrs backend: tcp://${APP_ELECTRS_NODE_IP}:${APP_ELECTRS_NODE_PORT}"
+fi
 exec /opt/frigate/bin/frigate -d "${DATA_ROOT}" -n "${NETWORK}"

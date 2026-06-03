@@ -56,15 +56,24 @@
   <p class="tagline">sparrow-frigate — Silent Payments (BIP352) en Signet</p>
 
   <section>
+    <h2>Puertos en tu Umbrel</h2>
+    <table>
+      <tr><th>Electrs (backend)</th><td><code>50001</code> — no uses este puerto en Sparrow para Silent Payments</td></tr>
+      <tr><th>Frigate (Sparrow)</th><td><code>50002</code> — servidor con soporte BIP352</td></tr>
+    </table>
+    <p class="note">Frigate escucha en <strong>50002</strong> y reenvía el resto de consultas Electrum a Electrs en <strong>50001</strong>. Es intencional: ambos no pueden compartir el mismo puerto.</p>
+  </section>
+
+  <section>
     <h2>Conexión Sparrow</h2>
     <table>
       <tr><th>Host</th><td><code id="host">umbrel.local</code></td></tr>
-      <tr><th>Puerto Electrum</th><td><code>50002</code></td></tr>
+      <tr><th>Puerto</th><td><code>50002</code> (Frigate, no 50001)</td></tr>
       <tr><th>SSL</th><td>Desactivado (red local)</td></tr>
       <tr><th>Red</th><td>Signet</td></tr>
-      <tr><th>Estado del servidor</th><td><span class="status status-pending" id="ready">Indexando o iniciando…</span></td></tr>
+      <tr><th>Estado</th><td><span class="status status-pending" id="ready">Indexando o iniciando…</span></td></tr>
     </table>
-    <p class="note">En los logs del contenedor <code>frigate</code> busca: <code>Electrum server listening on tcp://…</code></p>
+    <p class="note">Logs de <code>sparrow-frigate_frigate_1</code>: <code>Electrum server listening on tcp://…</code></p>
   </section>
 
   <section>
