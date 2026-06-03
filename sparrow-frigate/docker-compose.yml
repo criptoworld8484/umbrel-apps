@@ -33,10 +33,11 @@ services:
       default:
 
   frigate:
-    image: ghcr.io/criptoworld8484/frigate-umbrel-web:frigate-1.5.9
+    image: ghcr.io/criptoworld8484/frigate-umbrel-web:frigate-1.5.7
     restart: on-failure
     stop_grace_period: 5m
     user: "1000:1000"
+    entrypoint: ["/bin/sh", "/app-entrypoint/entrypoint.sh"]
     depends_on:
       init:
         condition: service_completed_successfully
@@ -56,6 +57,7 @@ services:
       FRIGATE_BITCOIN_DATA_DIR: "/bitcoin"
     volumes:
       - "${APP_DATA_DIR}/data:/data"
+      - "${APP_DATA_DIR}/entrypoint.sh:/app-entrypoint/entrypoint.sh:ro"
       - "${APP_BITCOIN_DATA_DIR}:/bitcoin:ro"
     ports:
       - "50002:50002"

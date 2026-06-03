@@ -4,9 +4,8 @@ set -eu
 EXPECTED_NETWORK="${FRIGATE_NETWORK:-signet}"
 
 if [ -n "${APP_BITCOIN_NETWORK:-}" ] && [ "${APP_BITCOIN_NETWORK}" != "${EXPECTED_NETWORK}" ]; then
-  echo "ERROR (sparrow-frigate): Bitcoin está en '${APP_BITCOIN_NETWORK}', se requiere '${EXPECTED_NETWORK}'."
-  echo "ERROR: En Bitcoin Node → Advanced → Signet, reinicia Bitcoin y luego esta app."
-  exit 1
+  echo "WARN (sparrow-frigate): Bitcoin está en '${APP_BITCOIN_NETWORK}', se esperaba '${EXPECTED_NETWORK}'."
+  echo "WARN: Cambia Bitcoin Node a Signet para que Frigate indexe correctamente."
 fi
 
 echo "sparrow-frigate pre-start OK (bitcoin network: ${APP_BITCOIN_NETWORK:-unknown})."
