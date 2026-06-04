@@ -1,12 +1,20 @@
-# Runtime image only. CI builds the binary with `cargo build --release` on the runner.
+FROM rust:1.83-slim AS builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN cargo build --release && strip target/release/broadcast-pool
+
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -u 1000 app
 
-COPY broadcast-pool-bin /usr/local/bin/broadcast-pool
+COPY --from=builder /build/target/release/broadcast-pool /usr/local/bin/broadcast-pool
 COPY src/api/dashboard.html /home/app/dashboard.html
-RUN chmod +x /usr/local/bin/broadcast-pool && chown -R app:app /home/app
+RUN chown -R app:app /home/app
 
 USER app
 WORKDIR /home/app

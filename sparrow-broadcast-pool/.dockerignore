@@ -1,4 +1,4 @@
 target/
-.git/
-**/*.md
 broadcast-pool-bin
+.git/
+.gitignore
