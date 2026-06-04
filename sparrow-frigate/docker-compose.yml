@@ -21,16 +21,29 @@ services:
         chmod 755 /data
 
   web:
-    image: nginx:1.27-alpine
+    image: node:20-alpine
     restart: on-failure
+    user: "1000:1000"
+    working_dir: /app
+    command: ["node", "server.js"]
     depends_on:
       init:
         condition: service_completed_successfully
     volumes:
-      - ${APP_DATA_DIR}/web:/usr/share/nginx/html:ro
-      - ${APP_DATA_DIR}/web/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${APP_DATA_DIR}/web:/app:ro
+    environment:
+      PORT: "3006"
+      DEVICE_DOMAIN_NAME: "${DEVICE_DOMAIN_NAME}"
+      ELECTRUM_PORT: "${APP_SPARROW_FRIGATE_ELECTRUM_PORT}"
+      ELECTRUM_LOCAL_SERVICE: "${DEVICE_DOMAIN_NAME}"
+      ELECTRUM_HIDDEN_SERVICE: "${APP_SPARROW_FRIGATE_RPC_HIDDEN_SERVICE}"
+      FRIGATE_STATUS_HOST: "${APP_SPARROW_FRIGATE_NODE_IP}"
+      FRIGATE_NETWORK: "signet"
+      APP_BITCOIN_NETWORK: "${APP_BITCOIN_NETWORK}"
+      APP_VERSION: "${APP_VERSION}"
     networks:
       default:
+        ipv4_address: ${APP_SPARROW_FRIGATE_IP}
 
   frigate:
     image: ghcr.io/criptoworld8484/frigate-umbrel-web:frigate-1.5.7
@@ -45,7 +58,7 @@ services:
       FRIGATE_NETWORK: "signet"
       FRIGATE_CACHE_SIZE: "2M"
       FRIGATE_MEMORY_LIMIT: "4GB"
-      APP_FRIGATE_ELECTRUM_PORT: "50002"
+      APP_FRIGATE_ELECTRUM_PORT: "${APP_SPARROW_FRIGATE_ELECTRUM_PORT}"
       APP_BITCOIN_NODE_IP: "${APP_BITCOIN_NODE_IP}"
       APP_BITCOIN_RPC_PORT: "${APP_BITCOIN_RPC_PORT}"
       APP_BITCOIN_RPC_USER: "${APP_BITCOIN_RPC_USER}"
@@ -60,6 +73,17 @@ services:
       - "${APP_DATA_DIR}/entrypoint.sh:/app-entrypoint/entrypoint.sh:ro"
       - "${APP_BITCOIN_DATA_DIR}:/bitcoin:ro"
     ports:
-      - "50002:50002"
+      - "${APP_SPARROW_FRIGATE_ELECTRUM_PORT}:${APP_SPARROW_FRIGATE_ELECTRUM_PORT}"
     networks:
       default:
+        ipv4_address: ${APP_SPARROW_FRIGATE_NODE_IP}
+
+  tor:
+    image: getumbrel/tor:0.4.7.8@sha256:2ace83f22501f58857fa9b403009f595137fa2e7986c4fda79d82a8119072b6a
+    user: "1000:1000"
+    restart: on-failure
+    volumes:
+      - ${APP_DATA_DIR}/torrc:/etc/tor/torrc:ro
+      - ${TOR_DATA_DIR}:/data
+    environment:
+      HOME: "/tmp"

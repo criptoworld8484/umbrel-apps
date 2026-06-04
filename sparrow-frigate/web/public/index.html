@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="es" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Frigate — Silent Payments</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          colors: { umbrel: "#5351FB" },
+        },
+      },
+    };
+  </script>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" integrity="sha512-CNgIRecGo7nphbeZ04Sc13ka07paqdeTu0WR1IM4kN_nkaApprslEr2fPWtNWrg1gZaw2E+ljhdFGtJxw2G2b0Q==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen">
+  <main class="max-w-5xl mx-auto px-6 py-14">
+    <!-- Header (estilo Electrs) -->
+    <div class="flex flex-col sm:flex-row items-start sm:items-center gap-6">
+      <div class="flex items-center justify-center w-32 h-32 rounded-3xl bg-slate-800 shadow-lg overflow-hidden shrink-0">
+        <img src="/icon.png" alt="Frigate" class="w-24 h-24 object-contain" onerror="this.style.display='none'">
+      </div>
+      <div>
+        <div class="flex items-center">
+          <svg width="8" height="8" viewBox="0 0 8 8" fill="none" aria-hidden="true">
+            <circle id="status-dot" cx="4" cy="4" r="4" fill="#94a3b8"/>
+          </svg>
+          <p id="status-text" class="ml-1 text-slate-400 text-lg">Starting</p>
+        </div>
+        <h1 class="text-4xl sm:text-5xl font-semibold text-white mt-1">Frigate</h1>
+        <p class="text-slate-400 font-medium mt-2">
+          Silent Payments (BIP352) · <span id="network-badge" class="text-umbrel">SIGNET</span>
+        </p>
+      </div>
+    </div>
+
+    <!-- Sync bar -->
+    <div class="flex justify-end mt-10 mb-2">
+      <h2 id="sync-label" class="font-semibold text-slate-200 pulse text-sm sm:text-base">
+        Conectando con Frigate…
+      </h2>
+    </div>
+    <div class="progress-track mb-2">
+      <div id="sync-bar" class="progress-fill" style="width: 5%"></div>
+    </div>
+
+    <!-- Connection panel (estilo Electrs / Fulcrum) -->
+    <section class="mt-16">
+      <p class="mb-8 text-slate-300 text-lg">
+        Usa estos datos para conectar <strong>Sparrow</strong> u otra cartera Electrum a Frigate.
+        Puerto <strong>50002</strong> (no uses Electrs en 50001 para Silent Payments).
+      </p>
+
+      <div class="flex flex-col md:grid md:grid-cols-12 md:gap-8">
+        <div class="flex justify-center md:col-span-4 md:items-start">
+          <div class="p-4 bg-white rounded-lg shadow max-w-fit">
+            <div id="qr-canvas" class="qr-wrap min-w-[220px] min-h-[220px] flex items-center justify-center"></div>
+          </div>
+        </div>
+
+        <div class="mt-8 md:mt-0 md:col-span-8">
+          <div class="flex flex-col space-y-4 items-center md:items-start">
+            <!-- LAN / Tor toggle -->
+            <div class="max-w-xs w-full">
+              <div class="rounded-full p-1 bg-slate-700">
+                <div class="relative rounded-full">
+                  <button type="button" id="btn-local" class="rounded-full px-4 py-2 w-1/2 font-medium text-white transition whitespace-nowrap">
+                    Local Network
+                  </button>
+                  <button type="button" id="btn-tor" class="rounded-full px-4 py-2 w-1/2 font-medium text-slate-800 dark:text-slate-300 transition">
+                    Tor
+                  </button>
+                  <span id="toggle-pill" class="absolute top-0 left-0 h-10 w-1/2 bg-umbrel rounded-full shadow-md transition-transform duration-500 ease-in-out" style="z-index: -1"></span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Address -->
+            <div class="w-full max-w-xl">
+              <label class="block text-xs font-bold uppercase text-slate-400 mb-1">Address</label>
+              <div class="flex rounded-lg border border-slate-600 bg-slate-800 overflow-hidden">
+                <code id="field-address" class="flex-1 px-3 py-2.5 text-sm break-all">…</code>
+                <button type="button" data-copy="address" class="copy-btn px-4 text-sm font-medium text-umbrel border-l border-slate-600">Copiar</button>
+              </div>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 w-full max-w-xl">
+              <div>
+                <label class="block text-xs font-bold uppercase text-slate-400 mb-1">Port</label>
+                <div class="flex rounded-lg border border-slate-600 bg-slate-800 overflow-hidden">
+                  <code id="field-port" class="flex-1 px-3 py-2.5 text-sm">…</code>
+                  <button type="button" data-copy="port" class="copy-btn px-4 text-sm font-medium text-umbrel border-l border-slate-600">Copiar</button>
+                </div>
+              </div>
+              <div>
+                <label class="block text-xs font-bold uppercase text-slate-400 mb-1">SSL</label>
+                <div class="flex rounded-lg border border-slate-600 bg-slate-800 overflow-hidden">
+                  <code id="field-ssl" class="flex-1 px-3 py-2.5 text-sm">…</code>
+                  <button type="button" data-copy="ssl" class="copy-btn px-4 text-sm font-medium text-umbrel border-l border-slate-600">Copiar</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="w-full max-w-xl">
+              <label class="block text-xs font-bold uppercase text-slate-400 mb-1">Connection string</label>
+              <div class="flex rounded-lg border border-slate-600 bg-slate-800 overflow-hidden">
+                <code id="field-connection-string" class="flex-1 px-3 py-2.5 text-sm break-all">…</code>
+                <button type="button" data-copy="connection-string" class="copy-btn px-4 text-sm font-medium text-umbrel border-l border-slate-600">Copiar</button>
+              </div>
+            </div>
+          </div>
+
+          <p class="mt-8 text-slate-400 text-sm max-w-xl">
+            En Sparrow: <em>Settings → Server → Private Electrum</em>, red Signet, sin SSL.
+            <a class="text-umbrel hover:underline ml-1" href="https://github.com/sparrowwallet/frigate" target="_blank" rel="noopener">Documentación Frigate</a>
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="mt-12 p-5 rounded-xl bg-slate-800/60 border border-slate-700 text-sm text-slate-400">
+      <strong class="text-slate-200">Requisitos:</strong> Bitcoin Signet con <code class="text-slate-300">txindex=1</code>,
+      Electrs en 50001 (backend), ZMQ sequence. Frigate indexa Silent Payments en el servidor.
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>

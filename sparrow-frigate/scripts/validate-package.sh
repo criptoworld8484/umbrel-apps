@@ -11,8 +11,10 @@ required=(
   Dockerfile
   entrypoint.sh
   icon.png
-  web/index.html
-  web/nginx.conf
+  torrc
+  web/server.js
+  web/public/index.html
+  web/public/app.js
   hooks/pre-start
 )
 
@@ -21,10 +23,13 @@ for f in "${required[@]}"; do
 done
 
 grep -q 'sparrow-frigate_web_1' docker-compose.yml
-grep -q 'nginx:1.27-alpine' docker-compose.yml
+grep -q 'node:20-alpine' docker-compose.yml
 grep -q 'frigate-umbrel-web:frigate-' docker-compose.yml
+grep -q 'APP_SPARROW_FRIGATE_NODE_IP' docker-compose.yml
+grep -q 'getumbrel/tor' docker-compose.yml
 grep -q 'icon.png' umbrel-app.yml
 bash -n entrypoint.sh
 bash -n hooks/pre-start
+bash -n exports.sh
 
 echo "Package validation passed."
