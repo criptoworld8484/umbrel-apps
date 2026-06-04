@@ -30,7 +30,10 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - id: ver
-        run: echo "version=$(grep '^version' sparrow-broadcast-pool/Cargo.toml | head -1 | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' sparrow-broadcast-pool/Cargo.toml | head -1)
+          test -n "$VERSION" || VERSION="0.1.0"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - uses: docker/build-push-action@v6
         with:
