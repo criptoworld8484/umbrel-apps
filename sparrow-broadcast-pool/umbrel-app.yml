@@ -31,7 +31,7 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  Versión inicial para Umbrel Community Store.
+  v0.1.0 - Imagen precompilada para instalación rápida en Umbrel (amd64/arm64).
 
   - Servidor Electrum para Sparrow (puerto 50050)
 
