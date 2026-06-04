@@ -12,20 +12,26 @@ services:
     restart: "no"
     volumes:
       - ${APP_DATA_DIR}/data:/data
+      - ${APP_DATA_DIR}/web:/web
     command:
       - sh
       - -c
       - |
-        mkdir -p /data/signet/db
-        chown -R 1000:1000 /data
+        mkdir -p /data/signet/db /web/public
+        chown -R 1000:1000 /data /web
         chmod 755 /data
 
   web:
-    image: ghcr.io/criptoworld8484/frigate-umbrel-web:ui-1.5.13
+    image: node:20-alpine
     restart: on-failure
+    user: "1000:1000"
+    working_dir: /app
+    command: ["node", "server.js"]
     depends_on:
       init:
         condition: service_completed_successfully
+    volumes:
+      - ${APP_DATA_DIR}/web:/app:ro
     environment:
       PORT: "3006"
       DEVICE_DOMAIN_NAME: "${DEVICE_DOMAIN_NAME}"
@@ -36,9 +42,6 @@ services:
       FRIGATE_NETWORK: "signet"
       APP_BITCOIN_NETWORK: "${APP_BITCOIN_NETWORK}"
       APP_VERSION: "${APP_VERSION}"
-    networks:
-      default:
-        ipv4_address: ${APP_SPARROW_FRIGATE_IP}
 
   frigate:
     image: ghcr.io/criptoworld8484/frigate-umbrel-web:frigate-1.5.7
