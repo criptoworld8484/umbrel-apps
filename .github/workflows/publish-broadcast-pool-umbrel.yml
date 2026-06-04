@@ -16,6 +16,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +39,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ghcr.io/criptoworld8484/broadcast-pool-umbrel:${{ steps.ver.outputs.version }}
             ghcr.io/criptoworld8484/broadcast-pool-umbrel:latest
