@@ -21,16 +21,11 @@ services:
         chmod 755 /data
 
   web:
-    image: node:20-alpine
+    image: ghcr.io/criptoworld8484/frigate-umbrel-web:ui-1.5.13
     restart: on-failure
-    user: "1000:1000"
-    working_dir: /app
-    command: ["node", "server.js"]
     depends_on:
       init:
         condition: service_completed_successfully
-    volumes:
-      - ${APP_DATA_DIR}/web:/app:ro
     environment:
       PORT: "3006"
       DEVICE_DOMAIN_NAME: "${DEVICE_DOMAIN_NAME}"

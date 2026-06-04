@@ -8,4 +8,7 @@ if [ -n "${APP_BITCOIN_NETWORK:-}" ] && [ "${APP_BITCOIN_NETWORK}" != "${EXPECTE
   echo "WARN: Cambia Bitcoin Node a Signet para que Frigate indexe correctamente."
 fi
 
+DIR="$(dirname "$0")"
+"${DIR}/sync-web-ui.sh" || true
+
 echo "sparrow-frigate pre-start OK (bitcoin network: ${APP_BITCOIN_NETWORK:-unknown})."
