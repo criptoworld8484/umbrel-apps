@@ -1,0 +1,605 @@
+use axum::{
+    extract::State,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{Html, IntoResponse, Json},
+    routing::{get, post},
+    Router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+use crate::config::Config;
+use crate::db::models::*;
+use crate::db::Database;
+use crate::pool::manager::PoolManager;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub pool_manager: Arc<PoolManager>,
+    pub db: Arc<Database>,
+    pub config: Arc<std::sync::Mutex<Config>>,
+}
+
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(dashboard))
+        .route("/api/stats", get(get_stats))
+        .route("/api/transactions", get(list_transactions))
+        .route("/api/transactions/import", post(import_transaction))
+        .route("/api/transactions/{id}/schedule", post(schedule_transaction))
+        .route("/api/transactions/{id}", get(get_transaction))
+        .route("/api/transactions/{id}/remove", post(remove_transaction))
+        .route("/api/transactions/{id}/retry", post(retry_transaction))
+        .route("/api/status", get(get_status))
+        .route("/api/config", get(get_config))
+        .route("/api/config", post(save_config))
+        .route("/api/restart", post(restart_daemon))
+        .route("/api/estimate-fee", post(estimate_fee))
+        .route("/api/test-indexer", post(test_indexer))
+        .with_state(state)
+}
+
+async fn dashboard() -> impl IntoResponse {
+    let html = load_dashboard_html();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    (headers, Html(html))
+}
+
+fn load_dashboard_html() -> String {
+    const EMBEDDED: &str = include_str!("dashboard.html");
+    /// Path to dashboard.html in the source tree at compile time. When the repo
+    /// is still present (typical local dev), serve this file so HTML edits apply
+    /// without rebuilding the binary.
+    const SOURCE_TREE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/api/dashboard.html");
+
+    if let Ok(path) = std::env::var("BROADCAST_POOL_DASHBOARD") {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                tracing::debug!("Serving dashboard from {}", path);
+                return content;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "BROADCAST_POOL_DASHBOARD={} unreadable ({}), using embedded HTML",
+                    path,
+                    e
+                );
+            }
+        }
+    } else if let Ok(content) = std::fs::read_to_string(SOURCE_TREE) {
+        tracing::debug!("Serving dashboard from {} (source tree)", SOURCE_TREE);
+        return content;
+    }
+    EMBEDDED.to_string()
+}
+
+fn supported_networks_vec() -> Vec<String> {
+    crate::config::NetworkType::supported_networks()
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Best-effort LAN IP for Sparrow (when electrum binds 0.0.0.0).
+fn detect_lan_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    for target in ["192.168.50.1:1", "10.0.0.1:1", "8.8.8.8:80"] {
+        if socket.connect(target).is_ok() {
+            if let Ok(addr) = socket.local_addr() {
+                let ip = addr.ip().to_string();
+                if !ip.starts_with("127.") && !ip.starts_with("0.") {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn sparrow_connect_url(config: &Config) -> String {
+    let host = config.electrum_server.host.as_str();
+    let connect_host = if host == "0.0.0.0" || host.is_empty() {
+        detect_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string())
+    } else {
+        host.to_string()
+    };
+    format!("{}:{}", connect_host, config.electrum_server.port)
+}
+
+async fn get_stats(State(state): State<AppState>) -> Result<Json<PoolStats>, (StatusCode, String)> {
+    state
+        .pool_manager
+        .get_stats()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn list_transactions(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<BroadcastTx>>, (StatusCode, String)> {
+    state
+        .pool_manager
+        .list_transactions(None, 100)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+#[derive(Deserialize)]
+struct ImportRequest {
+    tx_hex: String,
+    label: Option<String>,
+    target_fee_rate: Option<f64>,
+    network: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ScheduleRequest {
+    scheduled_time: Option<String>,
+    min_delay_hours: Option<u64>,
+    max_delay_hours: Option<u64>,
+    min_fee_rate: Option<f64>,
+    max_fee_rate: Option<f64>,
+    fixed_fee_rate: Option<f64>,
+}
+
+async fn import_transaction(
+    State(state): State<AppState>,
+    Json(req): Json<ImportRequest>,
+) -> Result<(StatusCode, Json<BroadcastTx>), (StatusCode, String)> {
+    let network = state.config.lock()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .network.network_type.data_dir_name()
+        .to_string();
+
+    let new_tx = NewBroadcastTx {
+        tx_hex: req.tx_hex,
+        network: req.network.unwrap_or(network),
+        nlocktime: None,
+        broadcast_mode: None,
+        scheduled_time: None,
+        target_fee_rate: req.target_fee_rate,
+        source_label: req.label,
+        destination_address: None,
+        utxo_count: Some(1),
+        total_value_btc: None,
+        replacement_of: None,
+    };
+
+    state
+        .pool_manager
+        .import_transaction(&new_tx)
+        .map(|tx| (StatusCode::CREATED, Json(tx)))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn schedule_transaction(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<ScheduleRequest>,
+) -> Result<Json<BroadcastTx>, (StatusCode, String)> {
+    // If exact datetime provided, use it directly
+    if let Some(ref time_str) = req.scheduled_time {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(time_str) {
+            let scheduled = dt.with_timezone(&chrono::Utc);
+            let fee_rate = req.fixed_fee_rate.unwrap_or(5.0);
+            return state
+                .pool_manager
+                .schedule_at(&id, scheduled, fee_rate)
+                .map(Json)
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("must be in the future")
+                        || msg.contains("cannot be before nLockTime")
+                    {
+                        (StatusCode::BAD_REQUEST, msg)
+                    } else {
+                        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+                    }
+                });
+        }
+    }
+
+    state
+        .pool_manager
+        .schedule_transaction(
+            &id,
+            req.min_delay_hours,
+            req.max_delay_hours,
+            req.min_fee_rate,
+            req.max_fee_rate,
+            req.fixed_fee_rate,
+        )
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn get_transaction(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<BroadcastTx>, (StatusCode, String)> {
+    state
+        .pool_manager
+        .get_transaction(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))
+}
+
+async fn remove_transaction(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    state
+        .pool_manager
+        .remove_transaction(&id)
+        .map(|_| StatusCode::OK)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+async fn retry_transaction(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<BroadcastTx>, (StatusCode, String)> {
+    state
+        .pool_manager
+        .retry_failed_transaction(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))
+}
+
+#[derive(serde::Serialize)]
+struct StatusResponse {
+    network: String,
+    network_display: String,
+    supported_networks: Vec<String>,
+    rpc_connected: bool,
+    electrum_connected: bool,
+    indexer_height: Option<u64>,
+    chain_mtp: Option<u64>,
+    pool_stats: PoolStats,
+    retain_by_default: bool,
+    sparrow_connect_url: String,
+}
+
+#[derive(serde::Serialize, Deserialize)]
+struct ConfigResponse {
+    indexer_url: String,
+    network: String,
+    broadcast_mode: String,
+    default_delay_hours: u64,
+    scheduled_datetime: Option<String>,
+    min_delay_hours: u64,
+    max_delay_hours: u64,
+    min_fee_rate: f64,
+    max_fee_rate: f64,
+    web_port: u16,
+    electrum_port: u16,
+    electrum_host: String,
+    sparrow_connect_url: String,
+    network_changed: bool,
+    supported_networks: Vec<String>,
+}
+
+async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
+    let config = state.config.lock().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(ConfigResponse {
+        indexer_url: config.indexer.as_ref().map(|e| e.url.clone()).unwrap_or_default(),
+        network: config.network.network_type.data_dir_name().to_string(),
+        broadcast_mode: config.schedule.broadcast_mode.to_string(),
+        default_delay_hours: config.schedule.default_delay_hours,
+        scheduled_datetime: config.schedule.scheduled_datetime.clone(),
+        min_delay_hours: config.schedule.min_delay_hours,
+        max_delay_hours: config.schedule.max_delay_hours,
+        min_fee_rate: config.schedule.min_fee_rate,
+        max_fee_rate: config.schedule.max_fee_rate,
+        web_port: config.web.port,
+        electrum_port: config.electrum_server.port,
+        electrum_host: config.electrum_server.host.clone(),
+        sparrow_connect_url: sparrow_connect_url(&config),
+        network_changed: false,
+        supported_networks: supported_networks_vec(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct SaveConfigRequest {
+    indexer_url: Option<String>,
+    network: Option<String>,
+    broadcast_mode: Option<String>,
+    default_delay_hours: Option<u64>,
+    scheduled_datetime: Option<String>,
+    min_delay_hours: Option<u64>,
+    max_delay_hours: Option<u64>,
+    min_fee_rate: Option<f64>,
+    max_fee_rate: Option<f64>,
+}
+
+async fn save_config(
+    State(state): State<AppState>,
+    Json(req): Json<SaveConfigRequest>,
+) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
+    tracing::info!("save_config called");
+    let mut config = state.config.lock().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    tracing::info!("Config lock acquired");
+
+    let mut network_changed = false;
+    let old_network = config.network.network_type.data_dir_name().to_string();
+
+    if let Some(ref net) = req.network {
+        let new_network = net.to_lowercase();
+        if new_network != old_network {
+            network_changed = true;
+        }
+        config.network.network_type = match new_network.as_str() {
+            "mainnet" => crate::config::NetworkType::Mainnet,
+            "testnet4" => crate::config::NetworkType::Testnet4,
+            "signet" => crate::config::NetworkType::Signet,
+            _ => config.network.network_type.clone(),
+        };
+    }
+    if let Some(url) = req.indexer_url {
+        config.indexer = Some(crate::config::IndexerConfig { url });
+    }
+    if let Some(mode) = req.broadcast_mode {
+        if let Ok(m) = mode.parse::<crate::config::BroadcastMode>() {
+            config.schedule.broadcast_mode = m;
+        }
+    }
+    if let Some(v) = req.default_delay_hours {
+        config.schedule.default_delay_hours = v;
+    }
+    if let Some(v) = req.scheduled_datetime {
+        config.schedule.scheduled_datetime = if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(v) = req.min_delay_hours {
+        config.schedule.min_delay_hours = v;
+    }
+    if let Some(v) = req.max_delay_hours {
+        config.schedule.max_delay_hours = v;
+    }
+    if let Some(v) = req.min_fee_rate {
+        config.schedule.min_fee_rate = v;
+    }
+    if let Some(v) = req.max_fee_rate {
+        config.schedule.max_fee_rate = v;
+    }
+    tracing::info!("Config modified");
+
+    let config_path = dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("broadcast-pool")
+        .join("config.toml");
+
+    if let Some(parent) = config_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let toml_str = toml::to_string_pretty(&*config).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("TOML error: {}", e)))?;
+    std::fs::write(&config_path, &toml_str).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("File write error: {}", e)))?;
+    tracing::info!("Config saved to {:?}", config_path);
+
+    let response = ConfigResponse {
+        indexer_url: config.indexer.as_ref().map(|e| e.url.clone()).unwrap_or_default(),
+        network: config.network.network_type.data_dir_name().to_string(),
+        broadcast_mode: config.schedule.broadcast_mode.to_string(),
+        default_delay_hours: config.schedule.default_delay_hours,
+        scheduled_datetime: config.schedule.scheduled_datetime.clone(),
+        min_delay_hours: config.schedule.min_delay_hours,
+        max_delay_hours: config.schedule.max_delay_hours,
+        min_fee_rate: config.schedule.min_fee_rate,
+        max_fee_rate: config.schedule.max_fee_rate,
+        web_port: config.web.port,
+        electrum_port: config.electrum_server.port,
+        electrum_host: config.electrum_server.host.clone(),
+        sparrow_connect_url: sparrow_connect_url(&config),
+        network_changed,
+        supported_networks: supported_networks_vec(),
+    };
+    tracing::info!("Response created, about to return");
+
+    drop(config);
+    tracing::info!("Config lock dropped");
+
+    Ok(Json(response))
+}
+
+async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse>, (StatusCode, String)> {
+    let pool_manager = state.pool_manager.clone();
+    let config = state.config.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let stats = pool_manager.get_stats().map_err(|e| e.to_string())?;
+        let rpc_connected = if let Some(rpc) = pool_manager.get_rpc() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let rpc_clone = rpc.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(rpc_clone.test_connection().unwrap_or(false));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or(false)
+        } else {
+            false
+        };
+        let has_indexer = if let Some(indexer) = pool_manager.get_indexer() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let indexer_clone = indexer.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(indexer_clone.test_connection().is_ok());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or(false)
+        } else {
+            false
+        };
+        let indexer_height = pool_manager.check_block_height().ok().flatten();
+        let chain_mtp = pool_manager.get_chain_mtp().ok();
+        let network = {
+            let cfg = config.lock().map_err(|e| e.to_string())?;
+            cfg.network.network_type.data_dir_name().to_string()
+        };
+        let network_display = {
+            let cfg = config.lock().map_err(|e| e.to_string())?;
+            cfg.network.network_type.display_name().to_string()
+        };
+        let sparrow_url = {
+            let cfg = config.lock().map_err(|e| e.to_string())?;
+            sparrow_connect_url(&cfg)
+        };
+        Ok::<_, String>((stats, rpc_connected, has_indexer, indexer_height, chain_mtp, network, network_display, sparrow_url))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {}", e)))?;
+
+    let (pool_stats, rpc_connected, electrum_connected, indexer_height, chain_mtp, network, network_display, sparrow_url) = result
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(StatusResponse {
+        network,
+        network_display,
+        supported_networks: supported_networks_vec(),
+        rpc_connected,
+        electrum_connected,
+        indexer_height,
+        chain_mtp,
+        pool_stats,
+        retain_by_default: true,
+        sparrow_connect_url: sparrow_url,
+    }))
+}
+
+#[derive(Deserialize)]
+struct EstimateFeeRequest {
+    tx_hex: String,
+}
+
+#[derive(Serialize)]
+struct EstimateFeeResponse {
+    fee_rate: f64,
+    fee_sat: u64,
+    vsize: usize,
+}
+
+async fn estimate_fee(
+    State(state): State<AppState>,
+    Json(req): Json<EstimateFeeRequest>,
+) -> Result<Json<EstimateFeeResponse>, (StatusCode, String)> {
+    // Use spawn_blocking for the synchronous indexer call
+    let config_clone = state.config.lock().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?.clone();
+    let tx_hex = req.tx_hex.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        if let Some(ref indexer) = config_clone.indexer {
+            if let Ok(electrum) = crate::rpc::ElectrumClient::new(&indexer.url) {
+                match electrum.calculate_tx_fee(&tx_hex) {
+                    Ok((fee_rate, fee, vsize)) => {
+                        return Ok(EstimateFeeResponse { fee_rate, fee_sat: fee, vsize });
+                    }
+                    Err(e) => {
+                        tracing::warn!("Fee estimation failed: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Fallback: estimate from TX size
+        if let Ok(raw) = hex::decode(&tx_hex) {
+            let tx_size = raw.len();
+            let vsize = tx_size * 3 / 4;
+            return Ok(EstimateFeeResponse {
+                fee_rate: 0.0,
+                fee_sat: 0,
+                vsize,
+            });
+        }
+
+        Err("Invalid transaction hex".to_string())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    result.map(Json).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+#[derive(Deserialize)]
+struct TestIndexerRequest {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct TestIndexerResponse {
+    success: bool,
+    url: String,
+    height: Option<u64>,
+    error: Option<String>,
+}
+
+async fn test_indexer(
+    Json(req): Json<TestIndexerRequest>,
+) -> Result<Json<TestIndexerResponse>, (StatusCode, String)> {
+    let url = req.url.clone();
+    let url_for_error = url.clone();
+    let url_for_timeout = url.clone();
+
+    let response = tokio::task::spawn_blocking(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match crate::rpc::ElectrumClient::new(&url) {
+                Ok(client) => {
+                    match client.test_connection() {
+                        Ok(true) => {
+                            let height = client.get_height().ok();
+                            TestIndexerResponse {
+                                success: true,
+                                url: url_for_error,
+                                height,
+                                error: None,
+                            }
+                        }
+                        Ok(false) => TestIndexerResponse {
+                            success: false,
+                            url: url_for_error,
+                            height: None,
+                            error: Some("Connection failed".to_string()),
+                        },
+                        Err(e) => TestIndexerResponse {
+                            success: false,
+                            url: url_for_error,
+                            height: None,
+                            error: Some(format!("Connection failed: {}", e)),
+                        },
+                    }
+                }
+                Err(e) => TestIndexerResponse {
+                    success: false,
+                    url: url_for_error,
+                    height: None,
+                    error: Some(format!("Invalid URL: {}", e)),
+                },
+            };
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|_| TestIndexerResponse {
+                success: false,
+                url: url_for_timeout,
+                height: None,
+                error: Some("Connection timeout (10s)".to_string()),
+            })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)))?;
+
+    Ok(Json(response))
+}
+
+async fn restart_daemon() -> impl IntoResponse {
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        tracing::info!("Daemon restart triggered");
+        std::process::exit(0);
+    });
+    let _ = handle.await;
+    "Restarting"
+}

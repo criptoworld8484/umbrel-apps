@@ -1,0 +1,54 @@
+manifestVersion: 1
+id: sparrow-broadcast-pool
+category: bitcoin
+name: Broadcast Pool
+version: "0.1.0"
+tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
+icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
+description: >-
+  Broadcast Pool retiene transacciones firmadas en Sparrow Wallet y las difunde
+  a la red en el momento que elijas: inmediato, por fecha/hora o por altura de
+  bloque.
+
+
+  Incluye un servidor Electrum integrado para que Sparrow se conecte a tu nodo
+  Umbrel sin usar indexadores externos. Las transacciones permanecen en un
+  mempool virtual local hasta que el scheduler las emite.
+
+
+  Características:
+
+  - Modos de envío: inmediato, programado (reloj) y por bloque
+
+  - Reprogramación si el MTP de cadena retrasa la emisión
+
+  - Dashboard web para monitorizar el pool
+
+  - Soporte mainnet, testnet4 y signet (según red del nodo Bitcoin)
+
+  - Conexión automática a Bitcoin Core y Electrs de Umbrel
+
+
+  Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
+releaseNotes: >-
+  Versión inicial para Umbrel Community Store.
+
+  - Servidor Electrum para Sparrow (puerto 50050)
+
+  - Dashboard web vía proxy Umbrel (puerto 8080)
+
+  - Integración con Bitcoin Node y Electrs
+
+  - Programación y reprogramación de transacciones
+developer: criptoworld8484
+website: https://github.com/criptoworld8484/umbrel-apps
+repo: https://github.com/criptoworld8484/umbrel-apps/tree/master/sparrow-broadcast-pool
+support: https://github.com/criptoworld8484/umbrel-apps/issues
+dependencies:
+  - bitcoin
+  - electrs
+port: 8080
+gallery: []
+path: ""
+defaultUsername: ""
+defaultPassword: ""
