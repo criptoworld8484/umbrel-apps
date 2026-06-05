@@ -8,7 +8,7 @@ const net = require("net");
 
 const PORT = Number(process.env.PORT || 3006);
 const PUBLIC_DIR = path.join(__dirname, "public");
-const ELECTRUM_PORT = process.env.ELECTRUM_PORT || process.env.APP_SPARROW_FRIGATE_ELECTRUM_PORT || "50002";
+const ELECTRUM_PORT = process.env.ELECTRUM_PORT || process.env.APP_SPARROW_FRIGATE_ELECTRUM_PORT || "57001";
 const LOCAL_HOST = process.env.DEVICE_DOMAIN_NAME || process.env.ELECTRUM_LOCAL_SERVICE || "umbrel.local";
 const TOR_HOST = process.env.ELECTRUM_HIDDEN_SERVICE || process.env.APP_SPARROW_FRIGATE_RPC_HIDDEN_SERVICE || "notyetset.onion";
 const FRIGATE_HOST = process.env.FRIGATE_STATUS_HOST || process.env.APP_SPARROW_FRIGATE_NODE_IP || "10.21.21.12";

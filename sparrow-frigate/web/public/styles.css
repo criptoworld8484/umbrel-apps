@@ -1,71 +1,54 @@
-@font-face {
-  font-family: "Inter";
-  font-style: normal;
-  font-weight: 400 700;
-  font-display: swap;
-  src: url("https://fonts.gstatic.com/s/inter/v18/UcCO3FwrK3iLTeHuS_nVMrMxCp50SjIw2boKoduHmQWTYfZFuSUqMxYzk.woff2") format("woff2");
-}
-
 html {
-  font-family: Inter, system-ui, -apple-system, sans-serif;
+  height: 100%;
 }
 
-html.dark {
-  color-scheme: dark;
+body {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "Helvetica Neue", "Segoe UI", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
 }
 
 .bg-umbrel {
   background-color: #5351fb;
 }
 
-.copy-btn {
-  transition: background 0.15s ease, color 0.15s ease;
+.copy-icon-btn {
+  cursor: pointer;
+  flex-shrink: 0;
 }
 
-.copy-btn:hover {
-  background: rgba(83, 81, 251, 0.15);
+.progressbar {
+  transition: width 0.25s ease;
 }
 
-.copy-btn.copied {
-  color: #00cd98;
-}
-
-.qr-logo {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 22%;
-  height: 22%;
-  transform: translate(-50%, -50%);
-  border-radius: 12px;
-  background: #fff;
-  padding: 4px;
-}
-
-.qr-wrap {
-  position: relative;
+.loading-placeholder {
   display: inline-block;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #e5e7eb 25%, #f3f4f6 50%, #e5e7eb 75%);
+  background-size: 200% 100%;
+  animation: loading-shimmer 1.4s ease infinite;
 }
 
-.progress-track {
-  background: #334155;
-  border-radius: 9999px;
-  overflow: hidden;
-  height: 8px;
+@media (prefers-color-scheme: dark) {
+  .loading-placeholder {
+    background: linear-gradient(90deg, #404040 25%, #525252 50%, #404040 75%);
+    background-size: 200% 100%;
+  }
 }
 
-.progress-fill {
-  background: #4ade80;
-  height: 100%;
-  border-radius: 9999px;
-  transition: width 0.4s ease;
+.loading-placeholder-lg {
+  height: 2.5rem;
+  width: 100%;
 }
 
-.pulse {
-  animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+@keyframes loading-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
 }
 
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
+.qr-image svg {
+  display: block;
 }

@@ -23,6 +23,6 @@ RUN chmod +x /entrypoint.sh
 
 USER 1000
 WORKDIR /data
-EXPOSE 50002
+EXPOSE 57001
 
 ENTRYPOINT ["/entrypoint.sh"]

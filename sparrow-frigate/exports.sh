@@ -1,7 +1,7 @@
 # Puertos e IPs (misma convención que Electrs/Fulcrum en Umbrel)
 export APP_SPARROW_FRIGATE_IP="10.21.22.12"
 export APP_SPARROW_FRIGATE_NODE_IP="10.21.21.12"
-export APP_SPARROW_FRIGATE_ELECTRUM_PORT="50002"
+export APP_SPARROW_FRIGATE_ELECTRUM_PORT="57001"
 export APP_SPARROW_FRIGATE_WEB_PORT="3006"
 
 rpc_hidden_service_file="${EXPORTS_TOR_DATA_DIR}/app-${EXPORTS_APP_ID}-rpc/hostname"

@@ -2,7 +2,7 @@
 # Umbrel no copia web/ ni entrypoint.sh al actualizar — sincronizar desde app-stores.
 set -eu
 
-UI_VERSION="1.5.14"
+UI_VERSION="1.5.15"
 UMBREL_ROOT="${UMBREL_ROOT:-/home/umbrel/umbrel}"
 APP_ID="sparrow-frigate"
 APP_DATA_DIR="${UMBREL_ROOT}/app-data/${APP_ID}"
@@ -32,7 +32,7 @@ if [ -z "${STORE_DIR}" ]; then
 fi
 
 mkdir -p "${APP_DATA_DIR}/web"
-rm -rf "${APP_DATA_DIR}/web/"*
+find "${APP_DATA_DIR}/web" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 cp -a "${STORE_DIR}/web/." "${APP_DATA_DIR}/web/"
 rm -f "${APP_DATA_DIR}/web/index.html" "${APP_DATA_DIR}/web/nginx.conf" 2>/dev/null || true
 

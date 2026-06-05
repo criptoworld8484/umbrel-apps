@@ -1,14 +1,16 @@
 (function () {
   "use strict";
 
+  var COPY_ICON =
+    "M10.9336 18H4.21875C2.66789 18 1.40625 16.7384 1.40625 15.1875V5.66016C1.40625 4.1093 2.66789 2.84766 4.21875 2.84766H10.9336C12.4845 2.84766 13.7461 4.1093 13.7461 5.66016V15.1875C13.7461 16.7384 12.4845 18 10.9336 18ZM4.21875 4.25391C3.44339 4.25391 2.8125 4.8848 2.8125 5.66016V15.1875C2.8125 15.9629 3.44339 16.5938 4.21875 16.5938H10.9336C11.709 16.5938 12.3398 15.9629 12.3398 15.1875V5.66016C12.3398 4.8848 11.709 4.25391 10.9336 4.25391H4.21875ZM16.5586 13.4297V2.8125C16.5586 1.26164 15.297 0 13.7461 0H5.94141C5.55304 0 5.23828 0.314758 5.23828 0.703125C5.23828 1.09149 5.55304 1.40625 5.94141 1.40625H13.7461C14.5215 1.40625 15.1523 2.03714 15.1523 2.8125V13.4297C15.1523 13.8181 15.4671 14.1328 15.8555 14.1328C16.2438 14.1328 16.5586 13.8181 16.5586 13.4297Z";
+  var COPIED_ICON =
+    "M4.21875 18H10.9336C12.4845 18 13.7461 16.7384 13.7461 15.1875V5.66016C13.7461 4.1093 12.4845 2.84766 10.9336 2.84766H4.21875C2.66789 2.84766 1.40625 4.1093 1.40625 5.66016V15.1875C1.40625 16.7384 2.66789 18 4.21875 18ZM16.5586 2.8125V13.4297C16.5586 13.8181 16.2438 14.1328 15.8555 14.1328C15.4671 14.1328 15.1523 13.8181 15.1523 13.4297V2.8125C15.1523 2.03714 14.5215 1.40625 13.7461 1.40625H5.94141C5.55304 1.40625 5.23828 1.09149 5.23828 0.703125C5.23828 0.314758 5.55304 0 5.94141 0H13.7461C15.297 0 16.5586 1.26164 16.5586 2.8125Z";
+
   var state = {
     network: "local",
     connection: null,
     syncPercent: -2,
-    version: "",
   };
-
-  var els = {};
 
   function $(id) {
     return document.getElementById(id);
@@ -20,14 +22,18 @@
     if (pill) {
       pill.classList.toggle("translate-x-full", mode === "tor");
     }
-    ["btn-local", "btn-tor"].forEach(function (id) {
-      var btn = $(id);
-      if (!btn) return;
-      var active = (id === "btn-local" && mode === "local") || (id === "btn-tor" && mode === "tor");
-      btn.classList.toggle("text-white", active);
-      btn.classList.toggle("text-slate-800", !active);
-      btn.classList.toggle("dark:text-white", active);
-    });
+    var btnLocal = $("btn-local");
+    var btnTor = $("btn-tor");
+    if (btnLocal) {
+      btnLocal.classList.toggle("text-white", mode === "local");
+      btnLocal.classList.toggle("duration-500", mode === "local");
+      btnLocal.classList.toggle("text-slate-800", mode !== "local");
+    }
+    if (btnTor) {
+      btnTor.classList.toggle("text-white", mode === "tor");
+      btnTor.classList.toggle("duration-500", mode === "tor");
+      btnTor.classList.toggle("text-slate-800", mode !== "tor");
+    }
     renderConnection();
   }
 
@@ -36,69 +42,111 @@
     return state.network === "tor" ? state.connection.tor : state.connection.local;
   }
 
+  function setFieldsVisible(visible) {
+    ["address", "port", "ssl"].forEach(function (key) {
+      var wrap = $("field-" + key + "-wrap");
+      var placeholder = $("placeholder-" + key);
+      if (wrap) wrap.classList.toggle("hidden", !visible);
+      if (placeholder) placeholder.classList.toggle("hidden", visible);
+    });
+  }
+
   function renderConnection() {
     var info = currentInfo();
-    var fields = ["address", "port", "ssl", "connection-string"];
-    fields.forEach(function (key) {
-      var el = $("field-" + key);
-      if (!el) return;
-      if (!info) {
-        el.textContent = "…";
-        return;
-      }
-      if (key === "address") el.textContent = info.address;
-      else if (key === "port") el.textContent = String(info.port);
-      else if (key === "ssl") el.textContent = info.ssl ? "Enabled" : "Disabled";
-      else if (key === "connection-string") el.textContent = info.connectionString;
-    });
-    renderQr(info && info.connectionString);
+    if (!info) {
+      setFieldsVisible(false);
+      renderQr(null);
+      return;
+    }
+
+    setFieldsVisible(true);
+    $("field-address").value = info.address || "";
+    $("field-port").value = String(info.port || "");
+    $("field-ssl").value = "Disabled";
+    renderQr(info.connectionString);
   }
 
   function renderQr(value) {
-    var canvas = $("qr-canvas");
-    if (!canvas || typeof QRCode === "undefined") return;
-    canvas.innerHTML = "";
+    var holder = $("qr-svg-holder");
+    var logo = $("qr-logo");
+    if (!holder || typeof QRCode === "undefined") return;
+
+    holder.innerHTML = "";
+    if (logo) logo.classList.add("hidden");
+
     if (!value || value.indexOf("notyetset") !== -1) {
-      canvas.innerHTML = '<p class="text-sm text-slate-500 p-8">Tor aún no disponible</p>';
+      holder.innerHTML =
+        '<p class="text-sm text-gray-500 p-8 text-center">Tor hidden service not ready yet</p>';
       return;
     }
-    new QRCode(canvas, {
-      text: value,
-      width: 220,
-      height: 220,
-      colorDark: "#0f172a",
-      colorLight: "#ffffff",
-      correctLevel: QRCode.CorrectLevel.H,
-    });
+
+    QRCode.toString(
+      value,
+      {
+        type: "svg",
+        width: 220,
+        margin: 1,
+        errorCorrectionLevel: "L",
+        color: { dark: "#000000", light: "#FFFFFF" },
+      },
+      function (err, svg) {
+        if (err) {
+          holder.innerHTML = '<p class="text-sm text-red-500 p-4">QR error</p>';
+          return;
+        }
+        holder.innerHTML = svg;
+        var svgEl = holder.querySelector("svg");
+        if (svgEl) {
+          svgEl.setAttribute("class", "qr-image mx-auto block");
+          svgEl.style.width = "220px";
+          svgEl.style.height = "220px";
+        }
+        if (logo) logo.classList.remove("hidden");
+      }
+    );
   }
 
-  function copyText(text, btn) {
-    if (!text) return;
-    navigator.clipboard.writeText(text).then(function () {
-      if (!btn) return;
-      btn.classList.add("copied");
-      var prev = btn.textContent;
-      btn.textContent = "Copiado";
-      setTimeout(function () {
-        btn.classList.remove("copied");
-        btn.textContent = prev;
-      }, 1500);
-      });
+  function copyFromInput(input, btn) {
+    if (!input) return;
+    input.select();
+    input.setSelectionRange(0, 99999);
+    var copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch (e) {
+      copied = false;
+    }
+    if (!copied && navigator.clipboard) {
+      navigator.clipboard.writeText(input.value);
+      copied = true;
+    }
+    if (!copied || !btn) return;
+
+    var path = btn.querySelector(".copy-path");
+    if (path) {
+      path.setAttribute("d", COPIED_ICON);
+      path.setAttribute("fill", "#00CD98");
+      path.setAttribute("fill-rule", "evenodd");
+      path.setAttribute("clip-rule", "evenodd");
+    }
+    window.setTimeout(function () {
+      input.blur();
+      if (window.getSelection) window.getSelection().removeAllRanges();
+      if (path) {
+        path.setAttribute("d", COPY_ICON);
+        path.setAttribute("fill", "#C3C6D1");
+        path.removeAttribute("fill-rule");
+        path.removeAttribute("clip-rule");
+      }
+    }, 1000);
   }
 
   function bindCopyButtons() {
-    document.querySelectorAll("[data-copy]").forEach(function (btn) {
+    document.querySelectorAll(".copy-icon-btn").forEach(function (btn) {
       btn.addEventListener("click", function () {
         var key = btn.getAttribute("data-copy");
-        var info = currentInfo();
-        if (!info) return;
-        var map = {
-          address: info.address,
-          port: String(info.port),
-          ssl: info.ssl ? "true" : "false",
-          "connection-string": info.connectionString,
-        };
-        copyText(map[key], btn);
+        var input = $("field-" + key);
+        copyFromInput(input, btn);
       });
     });
   }
@@ -110,22 +158,24 @@
     var bar = $("sync-bar");
     if (!label || !bar) return;
 
+    var progress = Math.max(0, Math.min(100, pct));
+    bar.style.width = progress + "%";
+    bar.setAttribute("aria-valuenow", String(progress));
+
+    label.classList.remove("animate-pulse");
     if (pct === -1) {
-      label.textContent = "Esperando a que Bitcoin termine de sincronizar…";
-      label.classList.add("pulse");
-      bar.style.width = "0%";
+      label.textContent = "Waiting for Bitcoin Node to finish syncing...";
+      label.classList.add("animate-pulse");
       return;
     }
     if (pct < 0) {
-      label.textContent = "Conectando con Frigate…";
-      label.classList.add("pulse");
-      bar.style.width = "5%";
+      label.textContent = "Connecting to Frigate server...";
+      label.classList.add("animate-pulse");
       return;
     }
-    label.classList.remove("pulse");
     var shown = pct >= 99.99 ? 100 : Math.round(pct);
-    label.textContent = shown + "% Sincronizado";
-    bar.style.width = shown + "%";
+    label.innerHTML =
+      "<span>" + shown + "%</span><span class=\"align-self-end ml-1\">Synchronized</span>";
 
     var dot = $("status-dot");
     var statusText = $("status-text");
@@ -149,8 +199,10 @@
     fetchJson("/api/v1/electrum-connection-details")
       .then(function (data) {
         state.connection = data;
-        var net = $("network-badge");
-        if (net) net.textContent = (data.network || "signet").toUpperCase();
+        var version = $("version-text");
+        if (version) {
+          version.textContent = data.appVersion || data.network || "...";
+        }
         renderConnection();
       })
       .catch(function () {});
@@ -161,9 +213,14 @@
   }
 
   function init() {
-    document.documentElement.classList.add("dark");
-    $("btn-local") && $("btn-local").addEventListener("click", function () { setNetwork("local"); });
-    $("btn-tor") && $("btn-tor").addEventListener("click", function () { setNetwork("tor"); });
+    $("btn-local") &&
+      $("btn-local").addEventListener("click", function () {
+        setNetwork("local");
+      });
+    $("btn-tor") &&
+      $("btn-tor").addEventListener("click", function () {
+        setNetwork("tor");
+      });
     bindCopyButtons();
     refresh();
     setInterval(refresh, 10000);
