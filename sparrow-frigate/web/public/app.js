@@ -69,7 +69,7 @@
   function renderQr(value) {
     var holder = $("qr-svg-holder");
     var logo = $("qr-logo");
-    if (!holder || typeof QRCode === "undefined") return;
+    if (!holder) return;
 
     holder.innerHTML = "";
     if (logo) logo.classList.add("hidden");
@@ -80,30 +80,27 @@
       return;
     }
 
-    QRCode.toString(
-      value,
-      {
-        type: "svg",
-        width: 220,
-        margin: 1,
-        errorCorrectionLevel: "L",
-        color: { dark: "#000000", light: "#FFFFFF" },
-      },
-      function (err, svg) {
-        if (err) {
-          holder.innerHTML = '<p class="text-sm text-red-500 p-4">QR error</p>';
-          return;
-        }
-        holder.innerHTML = svg;
-        var svgEl = holder.querySelector("svg");
-        if (svgEl) {
-          svgEl.setAttribute("class", "qr-image mx-auto block");
-          svgEl.style.width = "220px";
-          svgEl.style.height = "220px";
-        }
-        if (logo) logo.classList.remove("hidden");
+    if (typeof qrcode !== "function") {
+      holder.innerHTML =
+        '<p class="text-sm text-red-500 p-4 text-center">QR library unavailable</p>';
+      return;
+    }
+
+    try {
+      var qr = qrcode(0, "L");
+      qr.addData(value);
+      qr.make();
+      holder.innerHTML = qr.createSvgTag(8, 1);
+      var svgEl = holder.querySelector("svg");
+      if (svgEl) {
+        svgEl.setAttribute("class", "qr-image mx-auto block");
+        svgEl.style.width = "220px";
+        svgEl.style.height = "220px";
       }
-    );
+      if (logo) logo.classList.remove("hidden");
+    } catch (e) {
+      holder.innerHTML = '<p class="text-sm text-red-500 p-4 text-center">QR error</p>';
+    }
   }
 
   function copyFromInput(input, btn) {
