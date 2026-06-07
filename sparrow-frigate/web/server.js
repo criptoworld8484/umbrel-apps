@@ -9,7 +9,10 @@ const vm = require("vm");
 
 const PORT = Number(process.env.PORT || 3006);
 const PUBLIC_DIR = path.join(__dirname, "public");
-const QR_LIB = path.join(__dirname, "lib", "qrcode-generator.js");
+const QR_LIB_CANDIDATES = [
+  path.join(__dirname, "public", "vendor", "qrcode.js"),
+  path.join(__dirname, "lib", "qrcode-generator.js"),
+];
 const ELECTRUM_PORT = process.env.ELECTRUM_PORT || process.env.APP_SPARROW_FRIGATE_ELECTRUM_PORT || "57001";
 const LOCAL_HOST = process.env.DEVICE_DOMAIN_NAME || process.env.ELECTRUM_LOCAL_SERVICE || "umbrel.local";
 const TOR_HOST = process.env.ELECTRUM_HIDDEN_SERVICE || process.env.APP_SPARROW_FRIGATE_RPC_HIDDEN_SERVICE || "notyetset.onion";
@@ -30,7 +33,16 @@ let qrFactory = null;
 
 function getQrFactory() {
   if (!qrFactory) {
-    const src = fs.readFileSync(QR_LIB, "utf8");
+    let src = null;
+    for (const candidate of QR_LIB_CANDIDATES) {
+      if (fs.existsSync(candidate)) {
+        src = fs.readFileSync(candidate, "utf8");
+        break;
+      }
+    }
+    if (!src) {
+      throw new Error("QR library not found");
+    }
     const sandbox = { module: { exports: {} }, exports: {} };
     vm.runInNewContext(src, sandbox);
     qrFactory = sandbox.module.exports;
@@ -38,21 +50,42 @@ function getQrFactory() {
   return qrFactory;
 }
 
+function qrDataUrl(connectionString) {
+  if (!connectionString || connectionString.includes("notyetset")) {
+    return null;
+  }
+  try {
+    const svg = generateQrSvg(connectionString);
+    return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function enrichConnectionInfo(info) {
+  return {
+    ...info,
+    qrDataUrl: qrDataUrl(info.connectionString),
+  };
+}
+
 function connectionDetails() {
   const port = String(ELECTRUM_PORT);
+  const local = {
+    address: LOCAL_HOST,
+    port,
+    connectionString: `${LOCAL_HOST}:${port}:t`,
+    ssl: false,
+  };
+  const tor = {
+    address: TOR_HOST,
+    port,
+    connectionString: `${TOR_HOST}:${port}:t`,
+    ssl: false,
+  };
   return {
-    local: {
-      address: LOCAL_HOST,
-      port,
-      connectionString: `${LOCAL_HOST}:${port}:t`,
-      ssl: false,
-    },
-    tor: {
-      address: TOR_HOST,
-      port,
-      connectionString: `${TOR_HOST}:${port}:t`,
-      ssl: false,
-    },
+    local: enrichConnectionInfo(local),
+    tor: enrichConnectionInfo(tor),
     network: NETWORK,
     appVersion: APP_VERSION,
     walletHint: "Sparrow → Server → Private Electrum → Signet, sin SSL",
@@ -65,7 +98,7 @@ function generateQrSvg(text) {
   qr.addData(text);
   qr.make();
   const svg = qr.createSvgTag(5, 4);
-  return svg.replace("<svg ", '<svg width="220" height="220" ');
+  return svg.replace(/<svg\b[^>]*>/, '<svg width="220" height="220" xmlns="http://www.w3.org/2000/svg">');
 }
 
 function checkFrigatePort() {

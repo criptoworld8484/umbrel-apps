@@ -63,24 +63,28 @@
     $("field-address").value = info.address || "";
     $("field-port").value = String(info.port || "");
     $("field-ssl").value = "Disabled";
-    renderQr(info.connectionString);
+    renderQr(info);
   }
 
-  function renderQr(value) {
+  function renderQr(info) {
     var img = $("qr-image");
     var logo = $("qr-logo");
     var fallback = $("qr-fallback");
     if (!img) return;
 
-    if (!value || value.indexOf("notyetset") !== -1) {
+    var value = info && info.connectionString;
+    var dataUrl = info && info.qrDataUrl;
+
+    if (!value || value.indexOf("notyetset") !== -1 || !dataUrl) {
       img.classList.add("hidden");
+      img.removeAttribute("src");
       if (logo) logo.classList.add("hidden");
       if (fallback) fallback.classList.remove("hidden");
       return;
     }
 
     if (fallback) fallback.classList.add("hidden");
-    img.src = "/api/v1/qr.svg?network=" + encodeURIComponent(state.network);
+    img.src = dataUrl;
     img.classList.remove("hidden");
     if (logo) logo.classList.remove("hidden");
   }
