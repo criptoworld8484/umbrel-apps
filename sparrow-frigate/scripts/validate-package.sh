@@ -13,7 +13,9 @@ required=(
   icon.png
   torrc
   web/server.js
+  web/lib/qrcode-generator.js
   web/public/index.html
+  web/public/assets/umbrel-qr-icon.svg
   hooks/pre-start
   hooks/pre-install
   hooks/post-install

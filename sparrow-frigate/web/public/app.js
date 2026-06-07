@@ -67,40 +67,22 @@
   }
 
   function renderQr(value) {
-    var holder = $("qr-svg-holder");
+    var img = $("qr-image");
     var logo = $("qr-logo");
-    if (!holder) return;
-
-    holder.innerHTML = "";
-    if (logo) logo.classList.add("hidden");
+    var fallback = $("qr-fallback");
+    if (!img) return;
 
     if (!value || value.indexOf("notyetset") !== -1) {
-      holder.innerHTML =
-        '<p class="text-sm text-gray-500 p-8 text-center">Tor hidden service not ready yet</p>';
+      img.classList.add("hidden");
+      if (logo) logo.classList.add("hidden");
+      if (fallback) fallback.classList.remove("hidden");
       return;
     }
 
-    if (typeof qrcode !== "function") {
-      holder.innerHTML =
-        '<p class="text-sm text-red-500 p-4 text-center">QR library unavailable</p>';
-      return;
-    }
-
-    try {
-      var qr = qrcode(0, "L");
-      qr.addData(value);
-      qr.make();
-      holder.innerHTML = qr.createSvgTag(8, 1);
-      var svgEl = holder.querySelector("svg");
-      if (svgEl) {
-        svgEl.setAttribute("class", "qr-image mx-auto block");
-        svgEl.style.width = "220px";
-        svgEl.style.height = "220px";
-      }
-      if (logo) logo.classList.remove("hidden");
-    } catch (e) {
-      holder.innerHTML = '<p class="text-sm text-red-500 p-4 text-center">QR error</p>';
-    }
+    if (fallback) fallback.classList.add("hidden");
+    img.src = "/api/v1/qr.svg?network=" + encodeURIComponent(state.network);
+    img.classList.remove("hidden");
+    if (logo) logo.classList.remove("hidden");
   }
 
   function copyFromInput(input, btn) {

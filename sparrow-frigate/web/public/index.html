@@ -16,7 +16,6 @@
     };
   </script>
   <link rel="stylesheet" href="/styles.css">
-  <script src="/vendor/qrcode.js"></script>
 </head>
 <body class="min-h-full bg-slate-100 dark:bg-neutral-800 w-full text-neutral-900 dark:text-neutral-100">
   <div class="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8">
@@ -24,7 +23,7 @@
       <!-- Header -->
       <div class="flex justify-content-start align-items-center">
         <div class="mr-6 flex items-center justify-center">
-          <img class="rounded-3xl w-32 h-32 shadow-lg" src="/icon.png" alt="Frigate">
+          <img class="rounded-3xl w-32 h-32" src="/icon.png" alt="Frigate">
         </div>
         <div>
           <div class="flex items-center">
@@ -58,13 +57,22 @@
         <div class="flex flex-col md:grid md:grid-cols-12 md:gap-8">
           <div class="flex justify-center mt-8 md:mt-0 sm:text-center md:max-w-2xl md:mx-auto md:col-span-4 md:text-left md:items-center">
             <div class="max-w-fit p-4 bg-white rounded-lg shadow">
-              <div class="relative" id="qr-container">
-                <div id="qr-svg-holder" class="qr-image mx-auto min-w-[220px] min-h-[220px] flex items-center justify-center"></div>
-                <div id="qr-logo" class="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 flex items-center justify-center pointer-events-none hidden">
-                  <div class="bg-white w-24 h-24 rounded-2xl z-10 flex items-center justify-center">
-                    <img src="/icon.png" class="p-4 w-full h-full object-contain" alt="">
-                  </div>
-                </div>
+              <div class="qr-container">
+                <img
+                  id="qr-logo"
+                  src="/assets/umbrel-qr-icon.svg"
+                  class="qr-logo"
+                  alt=""
+                >
+                <img
+                  id="qr-image"
+                  src="/api/v1/qr.svg?network=local"
+                  class="qr-image flex justify-center"
+                  width="220"
+                  height="220"
+                  alt="Connection QR Code"
+                >
+                <p id="qr-fallback" class="qr-fallback hidden">Tor hidden service not ready yet</p>
               </div>
             </div>
           </div>

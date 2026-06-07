@@ -5,9 +5,11 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const net = require("net");
+const vm = require("vm");
 
 const PORT = Number(process.env.PORT || 3006);
 const PUBLIC_DIR = path.join(__dirname, "public");
+const QR_LIB = path.join(__dirname, "lib", "qrcode-generator.js");
 const ELECTRUM_PORT = process.env.ELECTRUM_PORT || process.env.APP_SPARROW_FRIGATE_ELECTRUM_PORT || "57001";
 const LOCAL_HOST = process.env.DEVICE_DOMAIN_NAME || process.env.ELECTRUM_LOCAL_SERVICE || "umbrel.local";
 const TOR_HOST = process.env.ELECTRUM_HIDDEN_SERVICE || process.env.APP_SPARROW_FRIGATE_RPC_HIDDEN_SERVICE || "notyetset.onion";
@@ -23,6 +25,18 @@ const MIME = {
   ".png": "image/png",
   ".ico": "image/x-icon",
 };
+
+let qrFactory = null;
+
+function getQrFactory() {
+  if (!qrFactory) {
+    const src = fs.readFileSync(QR_LIB, "utf8");
+    const sandbox = { module: { exports: {} }, exports: {} };
+    vm.runInNewContext(src, sandbox);
+    qrFactory = sandbox.module.exports;
+  }
+  return qrFactory;
+}
 
 function connectionDetails() {
   const port = String(ELECTRUM_PORT);
@@ -43,6 +57,15 @@ function connectionDetails() {
     appVersion: APP_VERSION,
     walletHint: "Sparrow → Server → Private Electrum → Signet, sin SSL",
   };
+}
+
+function generateQrSvg(text) {
+  const qrcode = getQrFactory();
+  const qr = qrcode(0, "H");
+  qr.addData(text);
+  qr.make();
+  const svg = qr.createSvgTag(5, 4);
+  return svg.replace("<svg ", '<svg width="220" height="220" ');
 }
 
 function checkFrigatePort() {
@@ -89,15 +112,44 @@ function serveStatic(req, res) {
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.url === "/health" || req.url === "/api/v1/ping") {
+  const urlPath = req.url.split("?")[0];
+
+  if (urlPath === "/health" || urlPath === "/api/v1/ping") {
     sendJson(res, 200, { operational: true });
     return;
   }
-  if (req.url === "/api/v1/electrum-connection-details") {
+
+  if (urlPath === "/api/v1/electrum-connection-details") {
     sendJson(res, 200, connectionDetails());
     return;
   }
-  if (req.url === "/api/v1/status") {
+
+  if (urlPath === "/api/v1/qr.svg") {
+    try {
+      const params = new URL(req.url, "http://localhost").searchParams;
+      const network = params.get("network") === "tor" ? "tor" : "local";
+      const details = connectionDetails();
+      const info = details[network];
+      const value = info.connectionString;
+      if (!value || value.includes("notyetset")) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("Tor hidden service not ready");
+        return;
+      }
+      const svg = generateQrSvg(value);
+      res.writeHead(200, {
+        "Content-Type": "image/svg+xml; charset=utf-8",
+        "Cache-Control": "no-cache",
+      });
+      res.end(svg);
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end("QR generation failed");
+    }
+    return;
+  }
+
+  if (urlPath === "/api/v1/status") {
     const frigate = await checkFrigatePort();
     sendJson(res, 200, {
       frigate,
@@ -108,6 +160,7 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
+
   serveStatic(req, res);
 });
 
