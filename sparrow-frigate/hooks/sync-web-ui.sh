@@ -2,7 +2,7 @@
 # Umbrel no copia web/ ni entrypoint.sh al actualizar — sincronizar desde app-stores.
 set -eu
 
-UI_VERSION="1.5.18"
+UI_VERSION="1.5.19"
 UMBREL_ROOT="${UMBREL_ROOT:-/home/umbrel/umbrel}"
 APP_ID="sparrow-frigate"
 APP_DATA_DIR="${UMBREL_ROOT}/app-data/${APP_ID}"

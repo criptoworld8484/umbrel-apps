@@ -97,8 +97,16 @@ function generateQrSvg(text) {
   const qr = qrcode(0, "H");
   qr.addData(text);
   qr.make();
-  const svg = qr.createSvgTag(5, 4);
-  return svg.replace(/<svg\b[^>]*>/, '<svg width="220" height="220" xmlns="http://www.w3.org/2000/svg">');
+  const moduleCount = qr.getModuleCount();
+  const margin = 4;
+  const targetSize = 220;
+  const cellSize = Math.max(1, Math.floor(targetSize / (moduleCount + margin * 2)));
+  const size = moduleCount * cellSize + margin * 2;
+  const svg = qr.createSvgTag(cellSize, margin);
+  return svg.replace(
+    /<svg\b[^>]*>/,
+    `<svg width="${targetSize}" height="${targetSize}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg" preserveAspectRatio="xMidYMid meet">`
+  );
 }
 
 function checkFrigatePort() {
