@@ -1,7 +1,8 @@
 #!/bin/sh
 set -eu
 
-NETWORK="${FRIGATE_NETWORK:-signet}"
+# Umbrel: mainnet | signet | testnet | testnet4 | regtest
+NETWORK="${FRIGATE_NETWORK:-${APP_BITCOIN_NETWORK:-mainnet}}"
 DATA_ROOT="/data"
 NETWORK_DIR="${DATA_ROOT}/${NETWORK}"
 CONFIG_FILE="${NETWORK_DIR}/config.toml"
@@ -25,6 +26,7 @@ resolve_cookie_file() {
     testnet)  [ -f "${BITCOIN_DATA_DIR}/testnet3/.cookie" ] && echo "${BITCOIN_DATA_DIR}/testnet3/.cookie" && return 0 ;;
     testnet4) [ -f "${BITCOIN_DATA_DIR}/testnet4/.cookie" ] && echo "${BITCOIN_DATA_DIR}/testnet4/.cookie" && return 0 ;;
     regtest)  [ -f "${BITCOIN_DATA_DIR}/regtest/.cookie" ] && echo "${BITCOIN_DATA_DIR}/regtest/.cookie" && return 0 ;;
+    mainnet)  [ -f "${BITCOIN_DATA_DIR}/.cookie" ] && echo "${BITCOIN_DATA_DIR}/.cookie" && return 0 ;;
     *)        [ -f "${BITCOIN_DATA_DIR}/.cookie" ] && echo "${BITCOIN_DATA_DIR}/.cookie" && return 0 ;;
   esac
   find "${BITCOIN_DATA_DIR}" -maxdepth 4 -name '.cookie' -type f 2>/dev/null | head -1
@@ -112,6 +114,7 @@ rpc_getblockchaininfo() {
 log_rpc_diagnostics() {
   echo "--- Bitcoin RPC diagnostics ---" >&2
   echo "URL: ${BITCOIN_RPC_URL}" >&2
+  echo "Frigate network: ${NETWORK}" >&2
   if has_userpass; then
     echo "Auth: USERPASS user=${APP_BITCOIN_RPC_USER} pass_len=${#APP_BITCOIN_RPC_PASS}" >&2
   else
@@ -130,9 +133,45 @@ log_rpc_diagnostics() {
       "${BITCOIN_RPC_URL}/" || echo "000")
     echo "HTTP probe (USERPASS): ${code} (000=unreachable, 401=bad auth)" >&2
   fi
-  echo "Is Bitcoin app running? Check: docker ps | grep bitcoin" >&2
-  echo "Is Electrs OK? If electrs works, RPC path is fine — compare its env." >&2
+  echo "Is Bitcoin app running on the same network (${NETWORK})? Check: docker ps | grep bitcoin" >&2
+  echo "Is Electrs OK on the same network? If electrs works, RPC path is fine." >&2
   echo "-------------------------------" >&2
+}
+
+validate_chain() {
+  chain="$1"
+  case "${NETWORK}" in
+    mainnet)
+      if [ "${chain}" != "main" ]; then
+        echo "ERROR: Frigate expects mainnet but bitcoind reports chain='${chain}'." >&2
+        echo "ERROR: Set Bitcoin Node to Mainnet, restart Bitcoin, then sparrow-frigate." >&2
+        exit 1
+      fi
+      ;;
+    signet)
+      if [ "${chain}" != "signet" ]; then
+        echo "ERROR: Frigate expects signet but bitcoind reports chain='${chain}'." >&2
+        echo "ERROR: Set Bitcoin Node to Signet (Advanced), restart Bitcoin, then sparrow-frigate." >&2
+        exit 1
+      fi
+      ;;
+    testnet|testnet4)
+      if [ "${chain}" != "test" ]; then
+        echo "ERROR: Frigate expects ${NETWORK} but bitcoind reports chain='${chain}'." >&2
+        echo "ERROR: Set Bitcoin Node to ${NETWORK}, restart Bitcoin, then sparrow-frigate." >&2
+        exit 1
+      fi
+      ;;
+    regtest)
+      if [ "${chain}" != "regtest" ]; then
+        echo "ERROR: Frigate expects regtest but bitcoind reports chain='${chain}'." >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "WARN: Unknown Frigate network '${NETWORK}', skipping chain validation (bitcoind chain='${chain}')." >&2
+      ;;
+  esac
 }
 
 wait_for_bitcoin() {
@@ -140,22 +179,8 @@ wait_for_bitcoin() {
   while [ "${attempt}" -lt "${BITCOIN_WAIT_MAX}" ]; do
     if resp=$(rpc_getblockchaininfo 2>/dev/null); then
       chain=$(echo "${resp}" | sed -n 's/.*"chain"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-      echo "Bitcoin Core reachable at ${BITCOIN_RPC_URL} (chain=${chain:-unknown})"
-      case "${NETWORK}" in
-        signet)
-          if [ "${chain}" != "signet" ]; then
-            echo "ERROR: Frigate uses -n signet but bitcoind reports chain='${chain}'." >&2
-            echo "ERROR: Set Bitcoin Node to Signet (Advanced), restart Bitcoin, then sparrow-frigate." >&2
-            exit 1
-          fi
-          ;;
-        testnet)
-          if [ "${chain}" != "test" ]; then
-            echo "ERROR: Frigate expects testnet but bitcoind chain='${chain}'." >&2
-            exit 1
-          fi
-          ;;
-      esac
+      echo "Bitcoin Core reachable at ${BITCOIN_RPC_URL} (chain=${chain:-unknown}, frigate_network=${NETWORK})"
+      validate_chain "${chain:-unknown}"
       return 0
     fi
     attempt=$((attempt + 1))

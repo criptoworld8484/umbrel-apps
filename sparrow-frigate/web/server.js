@@ -17,7 +17,7 @@ const ELECTRUM_PORT = process.env.ELECTRUM_PORT || process.env.APP_SPARROW_FRIGA
 const LOCAL_HOST = process.env.DEVICE_DOMAIN_NAME || process.env.ELECTRUM_LOCAL_SERVICE || "umbrel.local";
 const TOR_HOST = process.env.ELECTRUM_HIDDEN_SERVICE || process.env.APP_SPARROW_FRIGATE_RPC_HIDDEN_SERVICE || "notyetset.onion";
 const FRIGATE_HOST = process.env.FRIGATE_STATUS_HOST || process.env.APP_SPARROW_FRIGATE_NODE_IP || "10.21.21.12";
-const NETWORK = process.env.FRIGATE_NETWORK || process.env.APP_BITCOIN_NETWORK || "signet";
+const NETWORK = process.env.FRIGATE_NETWORK || process.env.APP_BITCOIN_NETWORK || "mainnet";
 const APP_VERSION = process.env.APP_VERSION || "";
 
 const MIME = {
@@ -88,7 +88,7 @@ function connectionDetails() {
     tor: enrichConnectionInfo(tor),
     network: NETWORK,
     appVersion: APP_VERSION,
-    walletHint: "Sparrow → Server → Private Electrum → Signet, sin SSL",
+    walletHint: `Sparrow → Server → Private Electrum → ${NETWORK}, sin SSL`,
   };
 }
 
