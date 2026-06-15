@@ -1,3 +1,4 @@
+# Self-contained build for Umbrel Community Store (context = this directory).
 FROM rust:1.86-bookworm AS builder
 
 WORKDIR /build
@@ -24,5 +25,5 @@ ENV BROADCAST_POOL_DATA_DIR=/home/app/data
 ENV BROADCAST_POOL_WEB_HOST=0.0.0.0
 ENV BROADCAST_POOL_ELECTRUM_HOST=0.0.0.0
 
-EXPOSE 8080 50050
+EXPOSE 8080 50050 50051
 CMD ["broadcast-pool", "start", "--foreground"]

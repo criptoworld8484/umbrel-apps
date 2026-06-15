@@ -88,6 +88,15 @@ impl BitcoinRpc {
         Ok(true)
     }
 
+    /// Bitcoin Core chain name: `main`, `test`, `signet`, etc.
+    pub fn get_bitcoin_chain(&self) -> Result<String> {
+        let info = self
+            .client
+            .get_blockchain_info()
+            .context("Failed to get blockchain info")?;
+        Ok(info.chain.to_string())
+    }
+
     pub fn get_median_time(&self) -> Result<u64> {
         let info = self
             .client

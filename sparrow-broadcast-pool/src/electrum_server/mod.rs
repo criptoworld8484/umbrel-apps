@@ -453,27 +453,90 @@ impl ElectrumServer {
     }
 
     pub async fn start(&self) -> Result<()> {
-        let addr = {
+        let (host, port, liana_port) = {
             let config = self.config.lock().map_err(|e| anyhow::anyhow!("Config lock: {}", e))?;
-            format!("{}:{}", config.electrum_server.host, config.electrum_server.port)
+            (
+                config.electrum_server.host.clone(),
+                config.electrum_server.port,
+                config.electrum_server.liana_port,
+            )
         };
-        let listener = TcpListener::bind(&addr).await?;
-        tracing::info!("Electrum server listening on {}", addr);
 
-        loop {
-            match listener.accept().await {
-                Ok((mut client_stream, peer_addr)) => {
-                    let pool_manager = self.pool_manager.clone();
-                    let config = self.config.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(pool_manager, config, client_stream, peer_addr).await {
-                            tracing::error!("Connection error: {}", e);
-                        }
-                    });
+        let pool_sparrow = self.pool_manager.clone();
+        let config_sparrow = self.config.clone();
+        let host_sparrow = host.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_electrum_listener(host_sparrow, port, "sparrow", pool_sparrow, config_sparrow)
+                    .await
+            {
+                tracing::error!("Sparrow Electrum listener error: {}", e);
+            }
+        });
+        tracing::info!("Electrum server (Sparrow) listening on {}:{}", host, port);
+
+        if let Some(liana_port) = liana_port {
+            let pool_liana = self.pool_manager.clone();
+            let config_liana = self.config.clone();
+            let host_liana = host.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_electrum_listener(
+                    host_liana,
+                    liana_port,
+                    "liana",
+                    pool_liana,
+                    config_liana,
+                )
+                .await
+                {
+                    tracing::error!("Liana Electrum listener error: {}", e);
                 }
-                Err(e) => {
-                    tracing::error!("Failed to accept connection: {}", e);
-                }
+            });
+            tracing::info!("Electrum server (Liana) listening on {}:{}", host, liana_port);
+        } else {
+            tracing::info!(
+                "No Liana Electrum port configured (set BROADCAST_POOL_LIANA_ELECTRUM_PORT or electrum_server.liana_port)"
+            );
+        }
+
+        // Keep the task alive (listeners run in spawned tasks).
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+async fn run_electrum_listener(
+    host: String,
+    port: u16,
+    source_label: &'static str,
+    pool_manager: Arc<PoolManager>,
+    config: Arc<Mutex<Config>>,
+) -> Result<()> {
+    let addr = format!("{}:{}", host, port);
+    let listener = TcpListener::bind(&addr).await?;
+    tracing::info!("Electrum listener [{}] bound on {}", source_label, addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((client_stream, peer_addr)) => {
+                let pool_manager = pool_manager.clone();
+                let config = config.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(
+                        pool_manager,
+                        config,
+                        client_stream,
+                        peer_addr,
+                        source_label,
+                    )
+                    .await
+                    {
+                        tracing::error!("Connection error ({}): {}", source_label, e);
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::error!("Failed to accept connection ({}): {}", source_label, e);
             }
         }
     }
@@ -484,6 +547,7 @@ async fn handle_connection(
     config: Arc<Mutex<Config>>,
     mut client_stream: tokio::net::TcpStream,
     peer_addr: std::net::SocketAddr,
+    source_label: &'static str,
 ) -> Result<()> {
     let indexer_url = {
         let cfg = config.lock().map_err(|e| anyhow::anyhow!("Config lock: {}", e))?;
@@ -558,8 +622,9 @@ async fn handle_connection(
                                             let pm = pool_manager.clone();
                                             let cfg = config.clone();
                                             let url = indexer_url.clone();
+                                            let src = source_label.to_string();
                                             let broadcast_result = tokio::task::spawn_blocking(move || {
-                                                handle_broadcast(&hex_owned, &pm, &cfg, &url)
+                                                handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
                                             }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join error: {}", e)));
 
                                             match broadcast_result {
@@ -815,7 +880,7 @@ async fn process_request(
             if let Some(params) = request.params.as_ref().and_then(|p| p.as_array()) {
                 if let Some(hex_param) = params.get(0).and_then(|v| v.as_str()) {
                     tracing::info!("broadcast request received, tx_hex length: {}", hex_param.len());
-                    match handle_broadcast(hex_param, pool_manager, config, "") {
+                    match handle_broadcast(hex_param, pool_manager, config, "", "sparrow") {
                         Ok(result) => {
                             tracing::info!("Broadcast success, returning txid: {}", result.txid);
                             return serde_json::json!({
@@ -990,6 +1055,37 @@ async fn process_request(
     }
 }
 
+fn resolve_ingest_plan(
+    source_label: &str,
+    nlocktime: u32,
+    config: &Config,
+    current_block_height: Option<u64>,
+) -> (BroadcastMode, Option<chrono::DateTime<chrono::Utc>>) {
+    if source_label == "liana" {
+        tracing::info!("Liana ingest → manual scheduling (pending until user sets date/price)");
+        return (BroadcastMode::Manual, None);
+    }
+    if source_label == "sparrow" && nlocktime == 0 {
+        tracing::info!("Sparrow ingest with nLockTime disabled → manual scheduling");
+        return (BroadcastMode::Manual, None);
+    }
+    // Block-height nLockTime already satisfied at ingest → manual (date/price scheduling).
+    // Future block-height or MTP locktimes keep by_block / scheduled behaviour.
+    if nlocktime > 0 && nlocktime < 500_000_000 {
+        if let Some(height) = current_block_height {
+            if height >= nlocktime as u64 {
+                tracing::info!(
+                    "Ingest with block-height nLockTime {} already satisfied (chain at {}) → manual scheduling",
+                    nlocktime,
+                    height
+                );
+                return (BroadcastMode::Manual, None);
+            }
+        }
+    }
+    resolve_broadcast_plan(nlocktime, config)
+}
+
 fn resolve_broadcast_plan(
     nlocktime: u32,
     config: &Config,
@@ -1027,6 +1123,7 @@ fn resolve_broadcast_plan(
                 (BroadcastMode::ByBlock, None)
             }
         }
+        BroadcastMode::Manual => (BroadcastMode::Manual, None),
     }
 }
 
@@ -1035,6 +1132,7 @@ fn handle_broadcast(
     pool_manager: &Arc<PoolManager>,
     config: &Arc<Mutex<Config>>,
     indexer_url: &str,
+    source_label: &str,
 ) -> Result<BroadcastHandleResult> {
     tracing::info!("handle_broadcast called with tx_hex length: {}", tx_hex.len());
 
@@ -1065,13 +1163,15 @@ fn handle_broadcast(
         cfg.network.network_type.data_dir_name().to_string()
     };
 
+    let current_block_height = pool_manager.check_block_height().ok().flatten();
     let (broadcast_mode, scheduled_time) = {
         let cfg = config.lock().map_err(|e| anyhow::anyhow!("Config lock: {}", e))?;
-        resolve_broadcast_plan(nlocktime, &cfg)
+        resolve_ingest_plan(source_label, nlocktime, &cfg, current_block_height)
     };
 
     tracing::info!(
-        "Broadcast plan: mode={}, scheduled={:?}, nlocktime={}",
+        "Broadcast plan: source={}, mode={}, scheduled={:?}, nlocktime={}",
+        source_label,
         broadcast_mode,
         scheduled_time,
         nlocktime
@@ -1088,7 +1188,7 @@ fn handle_broadcast(
         broadcast_mode: Some(broadcast_mode.to_string()),
         scheduled_time,
         target_fee_rate: None,
-        source_label: Some("sparrow".to_string()),
+        source_label: Some(source_label.to_string()),
         destination_address: None,
         utxo_count: Some(tx.input.len() as i32),
         total_value_btc: None,
@@ -1098,7 +1198,13 @@ fn handle_broadcast(
     tracing::info!("Calling pool_manager.import_transaction...");
     let imported_tx = pool_manager.import_transaction(&new_tx)?;
 
-    tracing::info!("Imported transaction from Sparrow: txid={} (mode: {}, pool_id: {})", txid, broadcast_mode, imported_tx.id);
+    tracing::info!(
+        "Imported transaction from {}: txid={} (mode: {}, pool_id: {})",
+        source_label,
+        txid,
+        broadcast_mode,
+        imported_tx.id
+    );
 
     fn store_retained(
         pool_manager: &PoolManager,

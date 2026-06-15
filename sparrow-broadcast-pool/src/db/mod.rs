@@ -10,13 +10,27 @@ use uuid::Uuid;
 
 use self::models::*;
 
-const BROADCAST_SELECT: &str = "id, tx_hex, txid, status, network, nlocktime, broadcast_mode, scheduled_time, broadcast_at, confirmed_at, block_height, target_fee_rate, actual_fee_rate, source_label, destination_address, utxo_count, total_value_btc, replacement_of, error_message, retry_count, broadcast_missed_at, original_scheduled_time, defer_until, created_at, updated_at";
+const BROADCAST_SELECT: &str = "id, tx_hex, txid, status, network, nlocktime, broadcast_mode, scheduled_time, broadcast_at, confirmed_at, block_height, target_fee_rate, actual_fee_rate, source_label, destination_address, utxo_count, total_value_btc, replacement_of, error_message, retry_count, broadcast_missed_at, original_scheduled_time, defer_until, schedule_trigger, target_price, price_currency, price_condition, created_at, updated_at";
 
 pub struct Database {
     conn: Mutex<Connection>,
 }
 
 impl Database {
+    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.conn.lock().map_err(|e| {
+            // #region agent log
+            crate::utils::debug_log::agent_log(
+                "H1",
+                "db/mod.rs:lock_conn",
+                "database mutex poisoned",
+                serde_json::json!({ "error": e.to_string() }),
+            );
+            // #endregion
+            anyhow::anyhow!("Database lock poisoned: {}", e)
+        })
+    }
+
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)
             .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
@@ -32,7 +46,7 @@ impl Database {
     }
 
     fn run_migrations(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.execute_batch(schema::MIGRATION_001)
             .context("Failed to run migrations")?;
 
@@ -80,6 +94,18 @@ impl Database {
             }
         }
 
+        // Migration 006: fiat price trigger columns
+        let add_price_result: Result<(), _> =
+            conn.execute_batch(schema::MIGRATION_006).context("Migration 006");
+        if let Err(e) = add_price_result {
+            let err_str = e.to_string();
+            if !err_str.contains("duplicate column") && !err_str.contains("already exists") {
+                tracing::warn!("Migration 006 warning (non-fatal): {}", e);
+            } else {
+                tracing::debug!("price trigger columns already exist, skipping migration 006");
+            }
+        }
+
         Ok(())
     }
 
@@ -94,7 +120,7 @@ impl Database {
         let broadcast_mode = tx.broadcast_mode.clone().unwrap_or_else(|| "immediate".to_string());
 
         {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.lock_conn()?;
             conn.execute(
                 "INSERT INTO broadcast_pool (id, tx_hex, status, network, nlocktime, broadcast_mode, scheduled_time, target_fee_rate, source_label, destination_address, utxo_count, total_value_btc, replacement_of, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
@@ -123,7 +149,7 @@ impl Database {
     }
 
     pub fn get_broadcast_tx_by_id(&self, id: &str) -> Result<BroadcastTx> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.query_row(
             &format!("SELECT {BROADCAST_SELECT} FROM broadcast_pool WHERE id = ?1"),
             params![id],
@@ -133,7 +159,7 @@ impl Database {
     }
 
     pub fn list_broadcast_txs(&self, status_filter: Option<&str>, network: &str, limit: i32) -> Result<Vec<BroadcastTx>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
 
         let map_row = map_broadcast_row;
 
@@ -161,7 +187,7 @@ impl Database {
     }
 
     pub fn update_tx_status(&self, id: &str, status: TxStatus, error: Option<&str>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE broadcast_pool SET status = ?1, error_message = ?2, updated_at = ?3 WHERE id = ?4",
@@ -173,7 +199,7 @@ impl Database {
 
     /// Move a failed tx back to scheduled so the scheduler can retry broadcast.
     pub fn reset_failed_to_scheduled(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let updated = conn
             .execute(
@@ -188,7 +214,7 @@ impl Database {
     }
 
     pub fn mark_broadcast(&self, id: &str, txid: &str, fee_rate: f64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE broadcast_pool SET status = 'broadcast', txid = ?1, actual_fee_rate = ?2, broadcast_at = ?3, updated_at = ?3, broadcast_missed_at = NULL, defer_until = NULL WHERE id = ?4",
@@ -199,7 +225,7 @@ impl Database {
     }
 
     pub fn get_tx_hex_by_txid(&self, txid: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare("SELECT tx_hex FROM broadcast_pool WHERE txid = ?1 AND status IN ('pending', 'scheduled') LIMIT 1")
             .context("Failed to prepare get_tx_hex query")?;
@@ -212,7 +238,7 @@ impl Database {
     }
 
     pub fn mark_confirmed(&self, id: &str, block_height: u64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE broadcast_pool SET status = 'confirmed', block_height = ?1, confirmed_at = ?2, updated_at = ?2 WHERE id = ?3",
@@ -223,7 +249,7 @@ impl Database {
     }
 
     pub fn get_due_transactions(&self, network: &str) -> Result<Vec<BroadcastTx>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let sql = format!(
             "SELECT {BROADCAST_SELECT} FROM broadcast_pool WHERE status = 'scheduled' AND network = ?1"
         );
@@ -248,7 +274,7 @@ impl Database {
         missed_at: &str,
         original_scheduled: Option<&str>,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         if let Some(orig) = original_scheduled {
             conn.execute(
@@ -273,18 +299,56 @@ impl Database {
         defer_until: Option<&str>,
         fee_rate: f64,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE broadcast_pool SET status = 'scheduled', scheduled_time = ?1, defer_until = ?2, target_fee_rate = ?3, error_message = NULL, updated_at = ?4 WHERE id = ?5",
+            "UPDATE broadcast_pool SET status = 'scheduled', scheduled_time = ?1, defer_until = ?2, target_fee_rate = ?3, error_message = NULL, schedule_trigger = 'datetime', target_price = NULL, price_currency = NULL, price_condition = NULL, updated_at = ?4 WHERE id = ?5",
             params![scheduled_time, defer_until, fee_rate, now, id],
         )
         .context("Failed to update reschedule")?;
         Ok(())
     }
 
+    pub fn update_price_schedule(
+        &self,
+        id: &str,
+        target_price: f64,
+        price_currency: &str,
+        price_condition: &str,
+        fee_rate: f64,
+    ) -> Result<()> {
+        let conn = self.lock_conn()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE broadcast_pool SET status = 'pending', scheduled_time = NULL, defer_until = NULL, target_fee_rate = ?1, error_message = NULL, schedule_trigger = 'price', target_price = ?2, price_currency = ?3, price_condition = ?4, updated_at = ?5 WHERE id = ?6",
+            params![fee_rate, target_price, price_currency, price_condition, now, id],
+        )
+        .context("Failed to update price schedule")?;
+        Ok(())
+    }
+
+    pub fn get_price_triggered_pending(&self, network: &str) -> Result<Vec<BroadcastTx>> {
+        let conn = self.lock_conn()?;
+        let sql = format!(
+            "SELECT {BROADCAST_SELECT} FROM broadcast_pool WHERE status IN ('pending', 'scheduled') AND schedule_trigger = 'price' AND target_price IS NOT NULL AND network = ?1"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .context("Failed to prepare price-triggered query")?;
+
+        let rows = stmt
+            .query_map(params![network], map_broadcast_row)
+            .context("Failed to query price-triggered txs")?;
+
+        let mut txs = Vec::new();
+        for row in rows {
+            txs.push(row.context("Failed to read row")?);
+        }
+        Ok(txs)
+    }
+
     pub fn get_pending_by_block_height(&self, network: &str) -> Result<Vec<BroadcastTx>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let sql = format!(
             "SELECT {BROADCAST_SELECT} FROM broadcast_pool WHERE status = 'pending' AND broadcast_mode = 'by_block' AND nlocktime > 0 AND nlocktime < 500000000 AND network = ?1"
         );
@@ -304,10 +368,10 @@ impl Database {
     }
 
     pub fn get_pending_by_scheduled_time(&self, network: &str) -> Result<Vec<BroadcastTx>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now();
         let sql = format!(
-            "SELECT {BROADCAST_SELECT} FROM broadcast_pool WHERE status = 'pending' AND broadcast_mode = 'scheduled' AND scheduled_time IS NOT NULL AND network = ?1"
+            "SELECT {BROADCAST_SELECT} FROM broadcast_pool WHERE status = 'pending' AND broadcast_mode IN ('scheduled', 'manual') AND scheduled_time IS NOT NULL AND network = ?1"
         );
         let mut stmt = conn
             .prepare(&sql)
@@ -332,10 +396,10 @@ impl Database {
     }
 
     pub fn get_pending_rebroadcast(&self, interval_minutes: i32, network: &str) -> Result<Vec<BroadcastTx>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let cutoff = Utc::now()
             .checked_sub_signed(chrono::Duration::minutes(interval_minutes as i64))
-            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("Invalid rebroadcast interval"))?
             .to_rfc3339();
 
         let sql = format!(
@@ -357,7 +421,7 @@ impl Database {
     }
 
     pub fn mark_due(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE broadcast_pool SET status = 'scheduled', scheduled_time = ?1, updated_at = ?1 WHERE id = ?2",
@@ -367,8 +431,20 @@ impl Database {
         Ok(())
     }
 
+    /// Price trigger fired: ready for broadcast loop (clears price-only waiting state).
+    pub fn mark_due_from_price_trigger(&self, id: &str) -> Result<()> {
+        let conn = self.lock_conn()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE broadcast_pool SET status = 'scheduled', scheduled_time = ?1, schedule_trigger = 'datetime', updated_at = ?2 WHERE id = ?3",
+            params![now, now, id],
+        )
+        .context("Failed to mark price-triggered tx as due")?;
+        Ok(())
+    }
+
     pub fn mark_due_with_schedule(&self, id: &str, scheduled_time: &DateTime<Utc>) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         let scheduled = scheduled_time.to_rfc3339();
         conn.execute(
@@ -380,14 +456,14 @@ impl Database {
     }
 
     pub fn remove_broadcast_tx(&self, id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.execute("DELETE FROM broadcast_pool WHERE id = ?1", params![id])
             .context("Failed to remove broadcast tx")?;
         Ok(())
     }
 
     pub fn get_pool_stats(&self, network: &str) -> Result<PoolStats> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT status, COUNT(*), COALESCE(SUM(total_value_btc), 0.0)
@@ -439,7 +515,7 @@ impl Database {
         let status = PlanStatus::Draft.as_str();
 
         {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.lock_conn()?;
             conn.execute(
                 "INSERT INTO migration_plans (id, name, source_wallet, destination_wallet, network, status, min_delay_hours, max_delay_hours, min_fee_rate, max_fee_rate, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
@@ -465,7 +541,7 @@ impl Database {
     }
 
     pub fn get_migration_plan_by_id(&self, id: &str) -> Result<MigrationPlan> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.query_row(
             "SELECT id, name, source_wallet, destination_wallet, network, status, min_delay_hours, max_delay_hours, min_fee_rate, max_fee_rate, total_transactions, completed_transactions, total_value_migrated_btc, created_at, updated_at
              FROM migration_plans WHERE id = ?1",
@@ -494,7 +570,7 @@ impl Database {
     }
 
     pub fn list_migration_plans(&self, network: &str) -> Result<Vec<MigrationPlan>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, source_wallet, destination_wallet, network, status, min_delay_hours, max_delay_hours, min_fee_rate, max_fee_rate, total_transactions, completed_transactions, total_value_migrated_btc, created_at, updated_at
@@ -532,7 +608,7 @@ impl Database {
     }
 
     pub fn update_plan_status(&self, id: &str, status: PlanStatus) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE migration_plans SET status = ?1, updated_at = ?2 WHERE id = ?3",
@@ -549,7 +625,7 @@ impl Database {
         let now = Utc::now().to_rfc3339();
 
         {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.lock_conn()?;
             conn.execute(
                 "INSERT INTO migration_utxos (id, plan_id, txid, vout, value_btc, address, label, source_label, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -572,7 +648,7 @@ impl Database {
     }
 
     pub fn get_migration_utxo_by_id(&self, id: &str) -> Result<MigrationUtxo> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.query_row(
             "SELECT id, plan_id, txid, vout, value_btc, address, label, source_label, broadcast_pool_id, created_at
              FROM migration_utxos WHERE id = ?1",
@@ -596,7 +672,7 @@ impl Database {
     }
 
     pub fn list_migration_utxos(&self, plan_id: &str) -> Result<Vec<MigrationUtxo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, plan_id, txid, vout, value_btc, address, label, source_label, broadcast_pool_id, created_at
@@ -629,7 +705,7 @@ impl Database {
     }
 
     pub fn link_utxo_to_pool(&self, utxo_id: &str, pool_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.execute(
             "UPDATE migration_utxos SET broadcast_pool_id = ?1 WHERE id = ?2",
             params![pool_id, utxo_id],
@@ -639,7 +715,7 @@ impl Database {
     }
 
     pub fn update_plan_total(&self, plan_id: &str, total: i32) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE migration_plans SET total_transactions = ?1, updated_at = ?2 WHERE id = ?3",
@@ -650,7 +726,7 @@ impl Database {
     }
 
     pub fn execute_raw(&self, sql: &str, params: &[&dyn rusqlite::types::ToSql]) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.lock_conn()?;
         conn.execute(sql, params).context("Failed to execute raw SQL")
     }
 }
@@ -690,8 +766,12 @@ fn map_broadcast_row(row: &rusqlite::Row) -> rusqlite::Result<BroadcastTx> {
         broadcast_missed_at: parse_optional_datetime(row.get::<_, Option<String>>(20)?),
         original_scheduled_time: parse_optional_datetime(row.get::<_, Option<String>>(21)?),
         defer_until: parse_optional_datetime(row.get::<_, Option<String>>(22)?),
-        created_at: parse_datetime(&row.get::<_, String>(23)?),
-        updated_at: parse_datetime(&row.get::<_, String>(24)?),
+        schedule_trigger: row.get(23)?,
+        target_price: row.get(24)?,
+        price_currency: row.get(25)?,
+        price_condition: row.get(26)?,
+        created_at: parse_datetime(&row.get::<_, String>(27)?),
+        updated_at: parse_datetime(&row.get::<_, String>(28)?),
         locktime_waiting: None,
         locktime_deferred: None,
         can_reschedule: None,
@@ -699,6 +779,7 @@ fn map_broadcast_row(row: &rusqlite::Row) -> rusqlite::Result<BroadcastTx> {
         locktime_target: None,
         locktime_remaining_secs: None,
         locktime_satisfied: None,
+        current_btc_price: None,
     })
 }
 

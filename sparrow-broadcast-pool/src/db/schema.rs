@@ -90,3 +90,10 @@ ALTER TABLE broadcast_pool ADD COLUMN broadcast_missed_at TEXT;
 ALTER TABLE broadcast_pool ADD COLUMN original_scheduled_time TEXT;
 ALTER TABLE broadcast_pool ADD COLUMN defer_until TEXT;
 "#;
+
+pub const MIGRATION_006: &str = r#"
+ALTER TABLE broadcast_pool ADD COLUMN schedule_trigger TEXT DEFAULT 'datetime';
+ALTER TABLE broadcast_pool ADD COLUMN target_price REAL;
+ALTER TABLE broadcast_pool ADD COLUMN price_currency TEXT;
+ALTER TABLE broadcast_pool ADD COLUMN price_condition TEXT;
+"#;

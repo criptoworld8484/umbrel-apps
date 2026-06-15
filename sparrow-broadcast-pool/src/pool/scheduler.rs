@@ -188,6 +188,47 @@ impl Scheduler {
         }
     }
 
+    pub async fn run_price_monitor(&self) -> Result<()> {
+        let interval = Duration::from_secs(60);
+        tracing::info!("Starting BTC/fiat price monitor loop (interval: 60s)");
+
+        loop {
+            let pool_manager = self.pool_manager.clone();
+            let price_feed = pool_manager.price_feed().clone();
+
+            let fetch_and_check = async move {
+                let snapshot = price_feed.fetch_snapshot().await?;
+                if snapshot.stale {
+                    tracing::warn!(
+                        "Price monitor using stale cache from {} — skipping trigger evaluation",
+                        snapshot.source
+                    );
+                    return Ok(0usize);
+                }
+                tracing::debug!(
+                    "BTC prices from {} (EUR={:?}, USD={:?})",
+                    snapshot.source,
+                    snapshot.prices.get("eur"),
+                    snapshot.prices.get("usd")
+                );
+                let prices = snapshot.prices;
+                let triggered = tokio::task::spawn_blocking(move || {
+                    pool_manager.check_price_triggers(&prices)
+                })
+                .await??;
+                Ok::<usize, anyhow::Error>(triggered)
+            };
+
+            match fetch_and_check.await {
+                Ok(n) if n > 0 => tracing::info!("Price monitor marked {} tx(s) as due", n),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("Price monitor tick failed: {}", e),
+            }
+
+            sleep(interval).await;
+        }
+    }
+
     pub async fn start_all_loops(&self) -> Result<()> {
         let pool_manager = self.pool_manager.clone();
         let config = self.config.clone();
@@ -226,6 +267,16 @@ impl Scheduler {
             let scheduler = Scheduler::new(pool_manager, config);
             if let Err(e) = scheduler.run_confirmation_checker().await {
                 tracing::error!("Confirmation checker error: {}", e);
+            }
+        });
+
+        let pool_manager = self.pool_manager.clone();
+        let config = self.config.clone();
+
+        tokio::spawn(async move {
+            let scheduler = Scheduler::new(pool_manager, config);
+            if let Err(e) = scheduler.run_price_monitor().await {
+                tracing::error!("Price monitor error: {}", e);
             }
         });
 

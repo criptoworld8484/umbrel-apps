@@ -24,6 +24,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(dashboard))
         .route("/api/stats", get(get_stats))
+        .route("/api/mempool-status", get(get_mempool_status))
         .route("/api/transactions", get(list_transactions))
         .route("/api/transactions/import", post(import_transaction))
         .route("/api/transactions/{id}/schedule", post(schedule_transaction))
@@ -36,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/restart", post(restart_daemon))
         .route("/api/estimate-fee", post(estimate_fee))
         .route("/api/test-indexer", post(test_indexer))
+        .route("/api/btc-price", get(get_btc_price))
         .with_state(state)
 }
 
@@ -84,30 +86,16 @@ fn supported_networks_vec() -> Vec<String> {
         .collect()
 }
 
-/// Best-effort LAN IP for Sparrow (when electrum binds 0.0.0.0).
-fn detect_lan_ip() -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    for target in ["192.168.50.1:1", "10.0.0.1:1", "8.8.8.8:80"] {
-        if socket.connect(target).is_ok() {
-            if let Ok(addr) = socket.local_addr() {
-                let ip = addr.ip().to_string();
-                if !ip.starts_with("127.") && !ip.starts_with("0.") {
-                    return Some(ip);
-                }
-            }
-        }
-    }
-    None
+/// Best-effort LAN IP for wallet Electrum connections (when server binds 0.0.0.0).
+fn wallet_connect_url(config: &Config) -> String {
+    crate::discovery::wallet_connect_url(config, config.electrum_server.port)
 }
 
-fn sparrow_connect_url(config: &Config) -> String {
-    let host = config.electrum_server.host.as_str();
-    let connect_host = if host == "0.0.0.0" || host.is_empty() {
-        detect_lan_ip().unwrap_or_else(|| "127.0.0.1".to_string())
-    } else {
-        host.to_string()
-    };
-    format!("{}:{}", connect_host, config.electrum_server.port)
+fn liana_connect_url(config: &Config) -> Option<String> {
+    config
+        .electrum_server
+        .liana_port
+        .map(|p| crate::discovery::wallet_connect_url(config, p))
 }
 
 async fn get_stats(State(state): State<AppState>) -> Result<Json<PoolStats>, (StatusCode, String)> {
@@ -118,14 +106,82 @@ async fn get_stats(State(state): State<AppState>) -> Result<Json<PoolStats>, (St
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
 }
 
+async fn get_mempool_status(
+    State(state): State<AppState>,
+) -> Json<MempoolStatus> {
+    let pool_manager = state.pool_manager.clone();
+    let status = tokio::task::spawn_blocking(move || pool_manager.get_mempool_status())
+        .await
+        .unwrap_or(MempoolStatus {
+            available: false,
+            mempool_tx_count: None,
+            fee_rate_sat_vb: None,
+            congestion: None,
+        });
+    Json(status)
+}
+
+#[derive(Serialize)]
+struct BtcPriceResponse {
+    prices: std::collections::HashMap<String, f64>,
+    provider: String,
+    source: String,
+    stale: bool,
+    fetched_at: String,
+}
+
+async fn get_btc_price(
+    State(state): State<AppState>,
+) -> Result<Json<BtcPriceResponse>, (StatusCode, String)> {
+    let feed = state.pool_manager.price_feed().clone();
+    let snapshot = feed
+        .fetch_snapshot()
+        .await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+    Ok(Json(BtcPriceResponse {
+        prices: snapshot.prices,
+        provider: feed.provider_name().to_string(),
+        source: snapshot.source,
+        stale: snapshot.stale,
+        fetched_at: snapshot.fetched_at.to_rfc3339(),
+    }))
+}
+
 async fn list_transactions(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<BroadcastTx>>, (StatusCode, String)> {
-    state
-        .pool_manager
-        .list_transactions(None, 100)
-        .map(Json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    // Warm price cache so table rows with price triggers show current BTC/fiat.
+    let feed = state.pool_manager.price_feed().clone();
+    if let Err(e) = feed.fetch_snapshot().await {
+        tracing::debug!("Could not prefetch BTC prices for list: {}", e);
+    }
+
+    let pool_manager = state.pool_manager.clone();
+    let started = std::time::Instant::now();
+    // #region agent log
+    crate::utils::debug_log::agent_log(
+        "H4",
+        "api/mod.rs:list_transactions",
+        "handler start",
+        serde_json::json!({ "blocking_on_async": true }),
+    );
+    // #endregion
+    let result = tokio::task::spawn_blocking(move || pool_manager.list_transactions(None, 100))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {}", e)))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    // #region agent log
+    crate::utils::debug_log::agent_log(
+        "H4",
+        "api/mod.rs:list_transactions",
+        "handler end",
+        serde_json::json!({
+            "elapsed_ms": started.elapsed().as_millis(),
+            "ok": result.is_ok(),
+        }),
+    );
+    // #endregion
+    result.map(Json)
 }
 
 #[derive(Deserialize)]
@@ -144,6 +200,9 @@ struct ScheduleRequest {
     min_fee_rate: Option<f64>,
     max_fee_rate: Option<f64>,
     fixed_fee_rate: Option<f64>,
+    target_price: Option<f64>,
+    price_currency: Option<String>,
+    price_condition: Option<String>,
 }
 
 async fn import_transaction(
@@ -181,6 +240,24 @@ async fn schedule_transaction(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(req): Json<ScheduleRequest>,
 ) -> Result<Json<BroadcastTx>, (StatusCode, String)> {
+    if let Some(target_price) = req.target_price {
+        let currency = req.price_currency.as_deref().unwrap_or("usd");
+        let condition = req.price_condition.as_deref().unwrap_or("above");
+        let fee_rate = req.fixed_fee_rate.unwrap_or(5.0);
+        return state
+            .pool_manager
+            .schedule_by_price(&id, target_price, currency, condition, fee_rate)
+            .map(Json)
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("must be") || msg.contains("only available") || msg.contains("Cannot set") {
+                    (StatusCode::BAD_REQUEST, msg)
+                } else {
+                    (StatusCode::INTERNAL_SERVER_ERROR, msg)
+                }
+            });
+    }
+
     // If exact datetime provided, use it directly
     if let Some(ref time_str) = req.scheduled_time {
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(time_str) {
@@ -221,9 +298,10 @@ async fn get_transaction(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<BroadcastTx>, (StatusCode, String)> {
-    state
-        .pool_manager
-        .get_transaction(&id)
+    let pool_manager = state.pool_manager.clone();
+    tokio::task::spawn_blocking(move || pool_manager.get_transaction(&id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {}", e)))?
         .map(Json)
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))
 }
@@ -261,7 +339,12 @@ struct StatusResponse {
     chain_mtp: Option<u64>,
     pool_stats: PoolStats,
     retain_by_default: bool,
-    sparrow_connect_url: String,
+    #[serde(alias = "sparrow_connect_url")]
+    wallet_connect_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    liana_connect_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lan_connect_host: Option<String>,
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -278,13 +361,19 @@ struct ConfigResponse {
     web_port: u16,
     electrum_port: u16,
     electrum_host: String,
-    sparrow_connect_url: String,
+    #[serde(alias = "sparrow_connect_url")]
+    wallet_connect_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    liana_connect_url: Option<String>,
+    lan_connect_host: Option<String>,
+    indexer_auto_detected: bool,
     network_changed: bool,
     supported_networks: Vec<String>,
 }
 
 async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
     let config = state.config.lock().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let indexer_auto = std::env::var("BROADCAST_POOL_INDEXER_URL").is_err();
     Ok(Json(ConfigResponse {
         indexer_url: config.indexer.as_ref().map(|e| e.url.clone()).unwrap_or_default(),
         network: config.network.network_type.data_dir_name().to_string(),
@@ -298,7 +387,10 @@ async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse
         web_port: config.web.port,
         electrum_port: config.electrum_server.port,
         electrum_host: config.electrum_server.host.clone(),
-        sparrow_connect_url: sparrow_connect_url(&config),
+        wallet_connect_url: wallet_connect_url(&config),
+        liana_connect_url: liana_connect_url(&config),
+        lan_connect_host: config.electrum_server.lan_connect_host.clone(),
+        indexer_auto_detected: indexer_auto,
         network_changed: false,
         supported_networks: supported_networks_vec(),
     }))
@@ -308,6 +400,7 @@ async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse
 struct SaveConfigRequest {
     indexer_url: Option<String>,
     network: Option<String>,
+    lan_connect_host: Option<String>,
     broadcast_mode: Option<String>,
     default_delay_hours: Option<u64>,
     scheduled_datetime: Option<String>,
@@ -342,6 +435,13 @@ async fn save_config(
     }
     if let Some(url) = req.indexer_url {
         config.indexer = Some(crate::config::IndexerConfig { url });
+    }
+    if let Some(lan) = req.lan_connect_host {
+        config.electrum_server.lan_connect_host = if lan.trim().is_empty() {
+            None
+        } else {
+            Some(lan.trim().to_string())
+        };
     }
     if let Some(mode) = req.broadcast_mode {
         if let Ok(m) = mode.parse::<crate::config::BroadcastMode>() {
@@ -382,6 +482,7 @@ async fn save_config(
     std::fs::write(&config_path, &toml_str).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("File write error: {}", e)))?;
     tracing::info!("Config saved to {:?}", config_path);
 
+    let indexer_auto = std::env::var("BROADCAST_POOL_INDEXER_URL").is_err();
     let response = ConfigResponse {
         indexer_url: config.indexer.as_ref().map(|e| e.url.clone()).unwrap_or_default(),
         network: config.network.network_type.data_dir_name().to_string(),
@@ -395,7 +496,10 @@ async fn save_config(
         web_port: config.web.port,
         electrum_port: config.electrum_server.port,
         electrum_host: config.electrum_server.host.clone(),
-        sparrow_connect_url: sparrow_connect_url(&config),
+        wallet_connect_url: wallet_connect_url(&config),
+        liana_connect_url: liana_connect_url(&config),
+        lan_connect_host: config.electrum_server.lan_connect_host.clone(),
+        indexer_auto_detected: indexer_auto,
         network_changed,
         supported_networks: supported_networks_vec(),
     };
@@ -443,17 +547,42 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
             let cfg = config.lock().map_err(|e| e.to_string())?;
             cfg.network.network_type.display_name().to_string()
         };
-        let sparrow_url = {
+        let (wallet_url, liana_url, lan_host) = {
             let cfg = config.lock().map_err(|e| e.to_string())?;
-            sparrow_connect_url(&cfg)
+            (
+                wallet_connect_url(&cfg),
+                liana_connect_url(&cfg),
+                cfg.electrum_server.lan_connect_host.clone(),
+            )
         };
-        Ok::<_, String>((stats, rpc_connected, has_indexer, indexer_height, chain_mtp, network, network_display, sparrow_url))
+        Ok::<_, String>((
+            stats,
+            rpc_connected,
+            has_indexer,
+            indexer_height,
+            chain_mtp,
+            network,
+            network_display,
+            wallet_url,
+            liana_url,
+            lan_host,
+        ))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {}", e)))?;
 
-    let (pool_stats, rpc_connected, electrum_connected, indexer_height, chain_mtp, network, network_display, sparrow_url) = result
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let (
+        pool_stats,
+        rpc_connected,
+        electrum_connected,
+        indexer_height,
+        chain_mtp,
+        network,
+        network_display,
+        wallet_url,
+        liana_url,
+        lan_host,
+    ) = result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(StatusResponse {
         network,
@@ -465,7 +594,9 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         chain_mtp,
         pool_stats,
         retain_by_default: true,
-        sparrow_connect_url: sparrow_url,
+        wallet_connect_url: wallet_url,
+        liana_connect_url: liana_url,
+        lan_connect_host: lan_host,
     }))
 }
 

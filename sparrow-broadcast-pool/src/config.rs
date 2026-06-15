@@ -23,6 +23,8 @@ pub enum BroadcastMode {
     Immediate,
     Scheduled,
     ByBlock,
+    /// Per-TX manual scheduling (Liana, or Sparrow with nLockTime disabled).
+    Manual,
 }
 
 impl Default for BroadcastMode {
@@ -37,6 +39,7 @@ impl std::fmt::Display for BroadcastMode {
             BroadcastMode::Immediate => write!(f, "immediate"),
             BroadcastMode::Scheduled => write!(f, "scheduled"),
             BroadcastMode::ByBlock => write!(f, "by_block"),
+            BroadcastMode::Manual => write!(f, "manual"),
         }
     }
 }
@@ -48,6 +51,7 @@ impl std::str::FromStr for BroadcastMode {
             "immediate" => Ok(BroadcastMode::Immediate),
             "scheduled" => Ok(BroadcastMode::Scheduled),
             "by_block" => Ok(BroadcastMode::ByBlock),
+            "manual" => Ok(BroadcastMode::Manual),
             _ => Err(format!("Unknown broadcast mode: {}", s)),
         }
     }
@@ -98,13 +102,13 @@ impl Config {
         }
         if let Ok(url) = std::env::var("BROADCAST_POOL_INDEXER_URL") {
             config.indexer = Some(IndexerConfig { url });
-        } else if let (Ok(host), Ok(port)) = (
-            std::env::var("APP_ELECTRS_NODE_IP"),
-            std::env::var("APP_ELECTRS_NODE_PORT"),
-        ) {
-            config.indexer = Some(IndexerConfig {
-                url: format!("tcp://{}:{}", host, port),
-            });
+        }
+        // Indexer host/port auto-discovery runs at startup (see discovery.rs).
+        if let Ok(ip) = std::env::var("BROADCAST_POOL_LAN_IP") {
+            let ip = ip.trim().to_string();
+            if !ip.is_empty() {
+                config.electrum_server.lan_connect_host = Some(ip);
+            }
         }
         if let Ok(network) = std::env::var("BROADCAST_POOL_NETWORK") {
             config.network.network_type = match network.to_lowercase().as_str() {
@@ -136,6 +140,11 @@ impl Config {
                 config.electrum_server.port = p;
             }
         }
+        if let Ok(port) = std::env::var("BROADCAST_POOL_LIANA_ELECTRUM_PORT") {
+            if let Ok(p) = port.parse() {
+                config.electrum_server.liana_port = Some(p);
+            }
+        }
 
         Ok(config)
     }
@@ -149,20 +158,17 @@ impl Config {
 
     pub fn default_config() -> Self {
         let network_type = std::env::var("BROADCAST_POOL_NETWORK")
+            .or_else(|_| std::env::var("APP_BITCOIN_NETWORK"))
             .map(|n| match n.to_lowercase().as_str() {
-                "mainnet" => NetworkType::Mainnet,
+                "mainnet" | "main" => NetworkType::Mainnet,
                 "signet" => NetworkType::Signet,
                 _ => NetworkType::Testnet4,
             })
             .unwrap_or(NetworkType::Testnet4);
 
-        let default_indexer = match network_type {
-            NetworkType::Mainnet => "ssl://192.168.50.97:50002",
-            NetworkType::Testnet4 | NetworkType::Signet => "192.168.50.26:50001",
-        };
-
-        let indexer_url = std::env::var("BROADCAST_POOL_INDEXER_URL")
-            .unwrap_or_else(|_| default_indexer.to_string());
+        let indexer = std::env::var("BROADCAST_POOL_INDEXER_URL")
+            .ok()
+            .map(|url| IndexerConfig { url });
 
         Self {
             network: NetworkConfig {
@@ -175,7 +181,7 @@ impl Config {
                     password: std::env::var("BROADCAST_POOL_RPC_PASS").unwrap_or_default(),
                 }
             }),
-            indexer: Some(IndexerConfig { url: indexer_url }),
+            indexer,
             pool: PoolConfig {
                 max_size_kb: 300,
                 rebroadcast_interval_minutes: 30,
@@ -210,6 +216,12 @@ impl Config {
                     .unwrap_or_else(|_| "50050".to_string())
                     .parse()
                     .unwrap_or(50050),
+                liana_port: std::env::var("BROADCAST_POOL_LIANA_ELECTRUM_PORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok()),
+                lan_connect_host: std::env::var("BROADCAST_POOL_LAN_IP")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
             },
         }
     }
@@ -329,6 +341,12 @@ impl Default for ScheduleConfig {
 pub struct ElectrumServerConfig {
     pub host: String,
     pub port: u16,
+    /// Optional dedicated Electrum port for Liana (manual scheduling ingest).
+    #[serde(default)]
+    pub liana_port: Option<u16>,
+    /// LAN IP shown to users for wallet connections (Sparrow/Liana). Bind may still use 0.0.0.0.
+    #[serde(default)]
+    pub lan_connect_host: Option<String>,
 }
 
 impl Default for ElectrumServerConfig {
@@ -336,6 +354,12 @@ impl Default for ElectrumServerConfig {
         Self {
             host: "0.0.0.0".to_string(),
             port: 50050,
+            liana_port: std::env::var("BROADCAST_POOL_LIANA_ELECTRUM_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok()),
+            lan_connect_host: std::env::var("BROADCAST_POOL_LAN_IP")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 }

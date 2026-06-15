@@ -1,9 +1,11 @@
 mod api;
 mod config;
 mod db;
+mod discovery;
 mod electrum_server;
 mod migration;
 mod pool;
+mod price;
 mod rpc;
 mod utils;
 
@@ -272,9 +274,31 @@ async fn main() -> Result<()> {
         } else {
             "Box<dyn Any>".to_string()
         };
-        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_else(|| "unknown".to_string());
-        eprintln!("PANIC on thread '{}': {}\nLocation: {}", thread_name, payload, location);
-        tracing::error!("PANIC on thread '{}': {}\nLocation: {}", thread_name, payload, location);
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        // #region agent log
+        crate::utils::debug_log::agent_log(
+            "H-PANIC",
+            &location,
+            "process panic",
+            serde_json::json!({
+                "thread": thread_name,
+                "payload": payload,
+            }),
+        );
+        // #endregion
+        eprintln!(
+            "PANIC on thread '{}': {}\nLocation: {}",
+            thread_name, payload, location
+        );
+        tracing::error!(
+            "PANIC on thread '{}': {}\nLocation: {}",
+            thread_name,
+            payload,
+            location
+        );
         default_hook(info);
     }));
 
@@ -340,6 +364,23 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // Auto-detect network (Bitcoin RPC), indexer (50001/50002), and LAN IP for wallet URL.
+    discovery::apply_network_from_rpc(&mut config, rpc.as_deref());
+    discovery::apply_indexer_discovery(&mut config);
+    discovery::apply_lan_ip(&mut config);
+
+    if let Some(ref url) = config.indexer.as_ref().map(|i| i.url.as_str()) {
+        tracing::info!("Indexer: {}", url);
+    }
+    if let Some(ref ip) = config.electrum_server.lan_connect_host {
+        tracing::info!(
+            "Wallet Electrum URL: {}:{} (Liana: {:?})",
+            ip,
+            config.electrum_server.port,
+            config.electrum_server.liana_port
+        );
+    }
 
     // Create Indexer client if configured
     let indexer = if let Some(ref indexer_config) = config.indexer {
@@ -409,7 +450,10 @@ async fn main() -> Result<()> {
                 "{}:{}",
                 config.electrum_server.host, config.electrum_server.port
             );
-            tracing::info!("Electrum server at {}", electrum_addr);
+            tracing::info!("Electrum server (Sparrow) at {}", electrum_addr);
+            if let Some(lp) = config.electrum_server.liana_port {
+                tracing::info!("Electrum server (Liana) at {}:{}", config.electrum_server.host, lp);
+            }
 
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             tracing::info!("Server listening on {}", bind_addr);

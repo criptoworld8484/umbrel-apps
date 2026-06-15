@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::db::models::*;
 use crate::db::Database;
+use crate::price::PriceFeed;
 use crate::rpc::BitcoinRpc;
 use crate::rpc::ElectrumClient;
 
@@ -32,6 +33,7 @@ pub struct PoolManager {
     config: Arc<Mutex<Config>>,
     pending_txs: Arc<Mutex<HashMap<String, PendingTxInfo>>>,
     mtp_cache: Arc<Mutex<Option<(Instant, u64)>>>,
+    price_feed: PriceFeed,
 }
 
 impl PoolManager {
@@ -48,6 +50,7 @@ impl PoolManager {
             config,
             pending_txs: Arc::new(Mutex::new(HashMap::new())),
             mtp_cache: Arc::new(Mutex::new(None)),
+            price_feed: PriceFeed::new(),
         }
     }
 
@@ -85,7 +88,9 @@ impl PoolManager {
         let is_reschedule = tx.broadcast_missed_at.is_some()
             || tx.defer_until.is_some()
             || tx.scheduled_time.is_some()
-            || tx.broadcast_mode.as_deref() == Some("scheduled");
+            || tx.schedule_trigger.as_deref() == Some("price")
+            || tx.broadcast_mode.as_deref() == Some("scheduled")
+            || tx.broadcast_mode.as_deref() == Some("manual");
 
         let defer_until = if is_reschedule {
             Some(scheduled_str.as_str())
@@ -99,6 +104,94 @@ impl PoolManager {
         let mut updated = self.db.get_broadcast_tx_by_id(id)?;
         self.enrich_tx_locktime(&mut updated);
         Ok(updated)
+    }
+
+    pub fn schedule_by_price(
+        &self,
+        id: &str,
+        target_price: f64,
+        price_currency: &str,
+        price_condition: &str,
+        fee_rate: f64,
+    ) -> Result<BroadcastTx> {
+        if target_price <= 0.0 {
+            anyhow::bail!("Target price must be positive");
+        }
+        let currency = match price_currency.to_lowercase().as_str() {
+            "eur" | "usd" => price_currency.to_lowercase(),
+            _ => anyhow::bail!("price_currency must be eur or usd"),
+        };
+        let condition = match price_condition.to_lowercase().as_str() {
+            "above" | "below" => price_condition.to_lowercase(),
+            _ => anyhow::bail!("price_condition must be above or below"),
+        };
+
+        let tx = self.db.get_broadcast_tx_by_id(id)?;
+        if !matches!(tx.status, TxStatus::Pending | TxStatus::Scheduled) {
+            anyhow::bail!("Cannot set price trigger on transaction in status {}", tx.status.as_str());
+        }
+        if tx.broadcast_mode.as_deref() != Some("manual") {
+            anyhow::bail!("Price trigger scheduling is only available for manual (pending) transactions");
+        }
+        if tx.nlocktime.is_some_and(|n| n > 0) {
+            anyhow::bail!("Price trigger scheduling is only available when nLockTime is disabled (0)");
+        }
+
+        self.db
+            .update_price_schedule(id, target_price, &currency, &condition, fee_rate)?;
+
+        let mut updated = self.db.get_broadcast_tx_by_id(id)?;
+        self.enrich_tx_locktime(&mut updated);
+        tracing::info!(
+            "Transaction {} waiting for BTC {} {} {:.2}",
+            id,
+            condition,
+            currency.to_uppercase(),
+            target_price
+        );
+        Ok(updated)
+    }
+
+    pub fn check_price_triggers(&self, prices: &std::collections::HashMap<String, f64>) -> Result<usize> {
+        let network = {
+            let config = self.config.lock().map_err(|e| anyhow::anyhow!("Config lock failed: {}", e))?;
+            config.network.network_type.data_dir_name().to_string()
+        };
+
+        let mut triggered = 0;
+        for tx in self.db.get_price_triggered_pending(&network)? {
+            let currency = tx.price_currency.as_deref().unwrap_or("usd");
+            let target = match tx.target_price {
+                Some(t) => t,
+                None => continue,
+            };
+            let condition = tx.price_condition.as_deref().unwrap_or("above");
+            let current = match prices.get(currency) {
+                Some(p) => *p,
+                None => continue,
+            };
+
+            if PriceFeed::price_condition_met(current, target, condition) {
+                tracing::info!(
+                    "Price trigger met for {} (BTC/{} = {:.2}, target {} {:.2})",
+                    tx.id,
+                    currency.to_uppercase(),
+                    current,
+                    condition,
+                    target
+                );
+                if let Err(e) = self.mark_due_from_price_trigger(&tx.id) {
+                    tracing::error!("Failed to mark price-triggered tx {} as due: {}", tx.id, e);
+                } else {
+                    triggered += 1;
+                }
+            }
+        }
+        Ok(triggered)
+    }
+
+    pub fn price_feed(&self) -> &PriceFeed {
+        &self.price_feed
     }
 
     pub fn broadcast_transaction(&self, tx_hex: &str) -> Result<String> {
@@ -366,17 +459,20 @@ impl PoolManager {
     }
 
     fn is_tx_due_for_broadcast(&self, tx: &BroadcastTx, now: DateTime<Utc>) -> Result<bool> {
-        let locktime_ok = self.is_locktime_satisfied(tx.nlocktime)?;
-
-        if tx.defer_until.is_some() && locktime_ok {
-            return Ok(true);
+        // Waiting for fiat price condition (monitor marks due separately).
+        if tx.schedule_trigger.as_deref() == Some("price")
+            && matches!(tx.status, TxStatus::Pending)
+        {
+            return Ok(false);
         }
 
+        let locktime_ok = self.is_locktime_satisfied(tx.nlocktime)?;
+
         if let Some(defer_until) = tx.defer_until {
-            if now >= defer_until {
-                return Ok(true);
+            if now < defer_until {
+                return Ok(false);
             }
-            return Ok(false);
+            return Ok(locktime_ok);
         }
 
         if tx
@@ -384,7 +480,7 @@ impl PoolManager {
             .as_ref()
             .is_some_and(|t| *t <= now)
         {
-            return Ok(true);
+            return Ok(locktime_ok);
         }
 
         Ok(false)
@@ -429,6 +525,14 @@ impl PoolManager {
 
     /// One scheduler tick: mark pending due, requeue failures, broadcast scheduled txs.
     pub fn run_scheduler_tick(&self) -> Result<Vec<(String, Result<String>)>> {
+        // #region agent log
+        crate::utils::debug_log::agent_log(
+            "H5",
+            "pool/manager.rs:run_scheduler_tick",
+            "tick start",
+            serde_json::json!({}),
+        );
+        // #endregion
         if !self.indexer_healthy() {
             anyhow::bail!("indexer unavailable");
         }
@@ -439,7 +543,13 @@ impl PoolManager {
         };
 
         for tx in self.get_pending_by_scheduled_time(&network)? {
-            if tx.broadcast_mode.as_deref() != Some("scheduled") {
+            if !matches!(
+                tx.broadcast_mode.as_deref(),
+                Some("scheduled") | Some("manual")
+            ) {
+                continue;
+            }
+            if tx.schedule_trigger.as_deref() == Some("price") {
                 continue;
             }
             tracing::info!("Pending tx {} has scheduled_time reached, marking as due", tx.id);
@@ -606,9 +716,11 @@ impl PoolManager {
 
     fn tx_has_broadcast_schedule(tx: &BroadcastTx) -> bool {
         tx.broadcast_mode.as_deref() == Some("scheduled")
+            || tx.broadcast_mode.as_deref() == Some("manual")
             || tx.scheduled_time.is_some()
             || tx.defer_until.is_some()
             || tx.broadcast_missed_at.is_some()
+            || tx.schedule_trigger.as_deref() == Some("price")
     }
 
     fn tx_can_reschedule(tx: &BroadcastTx) -> bool {
@@ -629,6 +741,14 @@ impl PoolManager {
         let deferred = tx.broadcast_missed_at.is_some() && !emitted;
         tx.locktime_deferred = Some(deferred);
         tx.can_reschedule = Some(!emitted && Self::tx_can_reschedule(tx));
+
+        if tx.schedule_trigger.as_deref() == Some("price") {
+            if let Some(currency) = &tx.price_currency {
+                if let Some(prices) = self.price_feed.cached_prices() {
+                    tx.current_btc_price = prices.get(currency).copied();
+                }
+            }
+        }
 
         let nlock = match tx.nlocktime {
             Some(n) if n > 0 && n > 500_000_000 => n,
@@ -677,6 +797,48 @@ impl PoolManager {
         self.db.get_pool_stats(&network)
     }
 
+    pub fn get_mempool_status(&self) -> MempoolStatus {
+        use crate::db::models::MempoolStatus;
+
+        let network = self
+            .config
+            .lock()
+            .map(|c| c.network.network_type.data_dir_name().to_string())
+            .unwrap_or_else(|_| "mainnet".to_string());
+
+        let Some(rpc) = self.rpc.as_ref() else {
+            return MempoolStatus {
+                available: false,
+                mempool_tx_count: None,
+                fee_rate_sat_vb: None,
+                congestion: None,
+            };
+        };
+
+        let node = match rpc.get_node_status() {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::debug!("Mempool status unavailable: {}", e);
+                return MempoolStatus {
+                    available: false,
+                    mempool_tx_count: None,
+                    fee_rate_sat_vb: None,
+                    congestion: None,
+                };
+            }
+        };
+
+        let fee_rate = rpc.estimate_smart_fee(6).ok().flatten();
+        let congestion = fee_rate.map(|f| classify_mempool_congestion(f, &network).to_string());
+
+        MempoolStatus {
+            available: true,
+            mempool_tx_count: node.mempool_size,
+            fee_rate_sat_vb: fee_rate,
+            congestion,
+        }
+    }
+
     pub fn get_pending_by_block_height(&self, network: &str) -> Result<Vec<BroadcastTx>> {
         self.db.get_pending_by_block_height(network)
     }
@@ -687,6 +849,10 @@ impl PoolManager {
 
     pub fn mark_as_due(&self, id: &str) -> Result<()> {
         self.db.mark_due(id)
+    }
+
+    pub fn mark_due_from_price_trigger(&self, id: &str) -> Result<()> {
+        self.db.mark_due_from_price_trigger(id)
     }
 
     pub fn mark_as_due_with_schedule(&self, id: &str, scheduled_time: &chrono::DateTime<chrono::Utc>) -> Result<()> {
@@ -736,7 +902,12 @@ impl PoolManager {
     }
 
     pub fn store_pending_tx(&self, txid: &str, tx_hex: &str, scripthashes: Vec<String>, outputs: Vec<PendingTxOutput>) {
-        let mut pending = self.pending_txs.lock().unwrap();
+        let sh_len = scripthashes.len();
+        let out_len = outputs.len();
+        let mut pending = match self.lock_pending() {
+            Some(p) => p,
+            None => return,
+        };
         pending.insert(
             txid.to_string(),
             PendingTxInfo {
@@ -745,7 +916,12 @@ impl PoolManager {
                 outputs,
             },
         );
-        tracing::info!("Stored pending tx {} with {} scripthashes, {} outputs", txid, pending.get(txid).unwrap().scripthashes.len(), pending.get(txid).unwrap().outputs.len());
+        tracing::info!(
+            "Stored pending tx {} with {} scripthashes, {} outputs",
+            txid,
+            sh_len,
+            out_len
+        );
     }
 
     pub fn lookup_tx_hex(&self, txid: &str) -> Option<String> {
@@ -769,26 +945,52 @@ impl PoolManager {
         None
     }
 
+    fn lock_pending(&self) -> Option<std::sync::MutexGuard<'_, HashMap<String, PendingTxInfo>>> {
+        match self.pending_txs.lock() {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                // #region agent log
+                crate::utils::debug_log::agent_log(
+                    "H2",
+                    "pool/manager.rs:lock_pending",
+                    "pending mutex poisoned",
+                    serde_json::json!({ "error": e.to_string() }),
+                );
+                // #endregion
+                tracing::error!("pending_txs mutex poisoned: {}", e);
+                None
+            }
+        }
+    }
+
     pub fn get_pending_tx_hex(&self, txid: &str) -> Option<String> {
-        let pending = self.pending_txs.lock().unwrap();
+        let pending = self.lock_pending()?;
         pending.get(txid).map(|info| info.tx_hex.clone())
     }
 
     pub fn get_all_pending_txs(&self) -> HashMap<String, PendingTxInfo> {
-        let pending = self.pending_txs.lock().unwrap();
-        pending.clone()
+        self.lock_pending()
+            .map(|pending| pending.clone())
+            .unwrap_or_default()
     }
 
     pub fn get_pending_txids_for_scripthash(&self, scripthash: &str) -> Vec<String> {
-        let pending = self.pending_txs.lock().unwrap();
-        pending.iter()
+        let pending = match self.lock_pending() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        pending
+            .iter()
             .filter(|(_, info)| info.scripthashes.contains(&scripthash.to_string()))
             .map(|(txid, _)| txid.clone())
             .collect()
     }
 
     pub fn get_pending_utxos_for_scripthash(&self, scripthash: &str) -> Vec<(String, u32, u64)> {
-        let pending = self.pending_txs.lock().unwrap();
+        let pending = match self.lock_pending() {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
         let mut utxos = Vec::new();
         for (txid, info) in pending.iter() {
             for output in &info.outputs {
@@ -801,7 +1003,10 @@ impl PoolManager {
     }
 
     pub fn get_pending_unconfirmed_value(&self, scripthash: &str) -> u64 {
-        let pending = self.pending_txs.lock().unwrap();
+        let pending = match self.lock_pending() {
+            Some(p) => p,
+            None => return 0,
+        };
         let mut total = 0u64;
         for (_, info) in pending.iter() {
             for output in &info.outputs {
@@ -814,7 +1019,10 @@ impl PoolManager {
     }
 
     pub fn remove_pending_tx(&self, txid: &str) {
-        let mut pending = self.pending_txs.lock().unwrap();
+        let mut pending = match self.lock_pending() {
+            Some(p) => p,
+            None => return,
+        };
         if pending.remove(txid).is_some() {
             tracing::info!("Removed pending tx {}", txid);
         }
@@ -833,4 +1041,18 @@ fn is_retriable_broadcast_error(msg: &str) -> bool {
         || m.contains("not final")
         || m.contains("locktime")
         || m.contains("too-long-mempool-chain")
+}
+
+fn classify_mempool_congestion(fee_sat_vb: f64, network: &str) -> &'static str {
+    let (low_max, high_min) = match network {
+        "mainnet" => (10.0, 50.0),
+        _ => (2.0, 15.0),
+    };
+    if fee_sat_vb < low_max {
+        "low"
+    } else if fee_sat_vb < high_min {
+        "medium"
+    } else {
+        "high"
+    }
 }

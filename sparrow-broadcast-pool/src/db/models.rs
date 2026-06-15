@@ -62,6 +62,16 @@ pub struct BroadcastTx {
     pub broadcast_missed_at: Option<DateTime<Utc>>,
     pub original_scheduled_time: Option<DateTime<Utc>>,
     pub defer_until: Option<DateTime<Utc>>,
+    /// `datetime` (default) or `price` — how this TX should be released for broadcast.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_currency: Option<String>,
+    /// `above` or `below` — broadcast when BTC price crosses target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_condition: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// Set at API/scheduler layer when scheduled time passed but chain locktime is not yet valid.
@@ -84,6 +94,9 @@ pub struct BroadcastTx {
     pub locktime_remaining_secs: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locktime_satisfied: Option<bool>,
+    /// Latest BTC/fiat price from price feed (enriched at API layer).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_btc_price: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +208,15 @@ pub struct PoolStats {
     pub confirmed: usize,
     pub failed: usize,
     pub total_value_btc: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolStatus {
+    pub available: bool,
+    pub mempool_tx_count: Option<usize>,
+    pub fee_rate_sat_vb: Option<f64>,
+    /// `low`, `medium`, or `high` when fee data is available.
+    pub congestion: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

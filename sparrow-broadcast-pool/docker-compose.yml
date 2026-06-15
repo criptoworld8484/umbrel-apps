@@ -15,7 +15,9 @@ services:
     command: ["sh", "-c", "mkdir -p /data && chown -R 1000:1000 /data && chmod 755 /data"]
 
   web:
-    image: ghcr.io/criptoworld8484/broadcast-pool-umbrel:0.1.0
+    build:
+      context: .
+      dockerfile: Dockerfile
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
@@ -24,6 +26,7 @@ services:
         condition: service_completed_successfully
     ports:
       - "50050:50050"
+      - "50051:50051"
     volumes:
       - ${APP_DATA_DIR}/data:/home/app/data
     environment:
@@ -34,7 +37,9 @@ services:
       BROADCAST_POOL_RPC_PASS: "${APP_BITCOIN_RPC_PASS}"
       APP_ELECTRS_NODE_IP: "${APP_ELECTRS_NODE_IP}"
       APP_ELECTRS_NODE_PORT: "${APP_ELECTRS_NODE_PORT}"
+      BROADCAST_POOL_LAN_IP: "${APP_SPARROW_BROADCAST_POOL_LAN_IP:-}"
       BROADCAST_POOL_WEB_HOST: "0.0.0.0"
       BROADCAST_POOL_WEB_PORT: "8080"
       BROADCAST_POOL_ELECTRUM_HOST: "0.0.0.0"
       BROADCAST_POOL_ELECTRUM_PORT: "50050"
+      BROADCAST_POOL_LIANA_ELECTRUM_PORT: "50051"

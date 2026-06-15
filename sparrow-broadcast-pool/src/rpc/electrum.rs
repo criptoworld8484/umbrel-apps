@@ -127,6 +127,26 @@ impl ElectrumClient {
         Ok(true)
     }
 
+    /// Genesis block hash (hex, lowercase) from the indexer.
+    pub fn genesis_block_hash(&self) -> Result<String> {
+        use electrum_client::ElectrumApi;
+        let mut client = self.connect()?;
+        let header = client
+            .block_header(0)
+            .context("Failed to read genesis block header")?;
+        Ok(header.block_hash().to_string().to_lowercase())
+    }
+
+    /// True when the indexer's genesis matches the expected network.
+    pub fn genesis_matches_network(
+        &self,
+        network: &crate::config::NetworkType,
+    ) -> Result<bool> {
+        let actual = self.genesis_block_hash()?;
+        let expected = network.genesis_hash().to_lowercase();
+        Ok(actual == expected)
+    }
+
     /// Median time past from the last 11 block headers (BIP113 approximation).
     pub fn get_median_time_past(&self) -> Result<u64> {
         let mut client = self.connect()?;
@@ -143,6 +163,29 @@ impl ElectrumClient {
             times.push(header.time as u64);
         }
         times.sort_unstable();
+        // #region agent log
+        crate::utils::debug_log::agent_log(
+            "H3",
+            "rpc/electrum.rs:get_median_time_past",
+            "mtp sample",
+            serde_json::json!({
+                "tip": tip,
+                "times_len": times.len(),
+                "start": start,
+            }),
+        );
+        // #endregion
+        if times.is_empty() {
+            // #region agent log
+            crate::utils::debug_log::agent_log(
+                "H3",
+                "rpc/electrum.rs:get_median_time_past",
+                "empty times vector",
+                serde_json::json!({ "tip": tip }),
+            );
+            // #endregion
+            anyhow::bail!("No block headers available for median time past");
+        }
         Ok(times[times.len() / 2])
     }
 }
