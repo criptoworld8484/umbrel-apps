@@ -37,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/restart", post(restart_daemon))
         .route("/api/estimate-fee", post(estimate_fee))
         .route("/api/test-indexer", post(test_indexer))
+        .route("/api/discover-indexer", post(discover_indexer))
         .route("/api/btc-price", get(get_btc_price))
         .with_state(state)
 }
@@ -91,11 +92,49 @@ fn wallet_connect_url(config: &Config) -> String {
     crate::discovery::wallet_connect_url(config, config.electrum_server.port)
 }
 
-fn liana_connect_url(config: &Config) -> Option<String> {
-    config
-        .electrum_server
-        .liana_port
-        .map(|p| crate::discovery::wallet_connect_url(config, p))
+fn config_to_response(config: &Config, network_changed: bool) -> ConfigResponse {
+    let umbrel = crate::discovery::is_umbrel_mode();
+    let pinned = std::env::var("BROADCAST_POOL_INDEXER_URL").is_ok();
+    let indexer = config.indexer.as_ref();
+    let active_url = indexer.map(|i| i.url.as_str()).unwrap_or("");
+    let is_manual = indexer.map(|i| i.manual_override).unwrap_or(false);
+    let node_display = if active_url.is_empty() {
+        String::new()
+    } else {
+        crate::discovery::display_indexer_url(active_url)
+    };
+
+    ConfigResponse {
+        indexer_url: if is_manual {
+            node_display.clone()
+        } else {
+            String::new()
+        },
+        indexer_node_url: node_display,
+        indexer_use_ssl: crate::discovery::indexer_url_uses_ssl(active_url),
+        indexer_is_manual: is_manual,
+        network_editable: !umbrel,
+        umbrel_mode: umbrel,
+        network: config.network.network_type.data_dir_name().to_string(),
+        broadcast_mode: config.schedule.broadcast_mode.to_string(),
+        default_delay_hours: config.schedule.default_delay_hours,
+        scheduled_datetime: config.schedule.scheduled_datetime.clone(),
+        min_delay_hours: config.schedule.min_delay_hours,
+        max_delay_hours: config.schedule.max_delay_hours,
+        min_fee_rate: config.schedule.min_fee_rate,
+        max_fee_rate: config.schedule.max_fee_rate,
+        web_port: config.web.port,
+        electrum_port: config.electrum_server.port,
+        electrum_host: config.electrum_server.host.clone(),
+        wallet_connect_url: wallet_connect_url(config),
+        indexer_auto_detected: !pinned && !is_manual,
+        network_changed,
+        supported_networks: supported_networks_vec(),
+    }
+}
+
+fn live_test_indexer_url(url: &str, network: &crate::config::NetworkType) -> bool {
+    crate::discovery::resolve_working_indexer_url(url, network).is_some()
 }
 
 async fn get_stats(State(state): State<AppState>) -> Result<Json<PoolStats>, (StatusCode, String)> {
@@ -341,15 +380,16 @@ struct StatusResponse {
     retain_by_default: bool,
     #[serde(alias = "sparrow_connect_url")]
     wallet_connect_url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    liana_connect_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    lan_connect_host: Option<String>,
 }
 
 #[derive(serde::Serialize, Deserialize)]
 struct ConfigResponse {
     indexer_url: String,
+    indexer_node_url: String,
+    indexer_use_ssl: bool,
+    indexer_is_manual: bool,
+    network_editable: bool,
+    umbrel_mode: bool,
     network: String,
     broadcast_mode: String,
     default_delay_hours: u64,
@@ -363,9 +403,6 @@ struct ConfigResponse {
     electrum_host: String,
     #[serde(alias = "sparrow_connect_url")]
     wallet_connect_url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    liana_connect_url: Option<String>,
-    lan_connect_host: Option<String>,
     indexer_auto_detected: bool,
     network_changed: bool,
     supported_networks: Vec<String>,
@@ -373,34 +410,14 @@ struct ConfigResponse {
 
 async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
     let config = state.config.lock().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let indexer_auto = std::env::var("BROADCAST_POOL_INDEXER_URL").is_err();
-    Ok(Json(ConfigResponse {
-        indexer_url: config.indexer.as_ref().map(|e| e.url.clone()).unwrap_or_default(),
-        network: config.network.network_type.data_dir_name().to_string(),
-        broadcast_mode: config.schedule.broadcast_mode.to_string(),
-        default_delay_hours: config.schedule.default_delay_hours,
-        scheduled_datetime: config.schedule.scheduled_datetime.clone(),
-        min_delay_hours: config.schedule.min_delay_hours,
-        max_delay_hours: config.schedule.max_delay_hours,
-        min_fee_rate: config.schedule.min_fee_rate,
-        max_fee_rate: config.schedule.max_fee_rate,
-        web_port: config.web.port,
-        electrum_port: config.electrum_server.port,
-        electrum_host: config.electrum_server.host.clone(),
-        wallet_connect_url: wallet_connect_url(&config),
-        liana_connect_url: liana_connect_url(&config),
-        lan_connect_host: config.electrum_server.lan_connect_host.clone(),
-        indexer_auto_detected: indexer_auto,
-        network_changed: false,
-        supported_networks: supported_networks_vec(),
-    }))
+    Ok(Json(config_to_response(&config, false)))
 }
 
 #[derive(Deserialize)]
 struct SaveConfigRequest {
     indexer_url: Option<String>,
+    indexer_use_ssl: Option<bool>,
     network: Option<String>,
-    lan_connect_host: Option<String>,
     broadcast_mode: Option<String>,
     default_delay_hours: Option<u64>,
     scheduled_datetime: Option<String>,
@@ -420,29 +437,58 @@ async fn save_config(
 
     let mut network_changed = false;
     let old_network = config.network.network_type.data_dir_name().to_string();
+    let network_editable = !crate::discovery::is_umbrel_mode();
 
-    if let Some(ref net) = req.network {
-        let new_network = net.to_lowercase();
-        if new_network != old_network {
-            network_changed = true;
+    if network_editable {
+        if let Some(ref net) = req.network {
+            let new_network = net.to_lowercase();
+            if new_network != old_network {
+                network_changed = true;
+            }
+            config.network.network_type = match new_network.as_str() {
+                "mainnet" => crate::config::NetworkType::Mainnet,
+                "testnet4" => crate::config::NetworkType::Testnet4,
+                "signet" => crate::config::NetworkType::Signet,
+                _ => config.network.network_type.clone(),
+            };
         }
-        config.network.network_type = match new_network.as_str() {
-            "mainnet" => crate::config::NetworkType::Mainnet,
-            "testnet4" => crate::config::NetworkType::Testnet4,
-            "signet" => crate::config::NetworkType::Signet,
-            _ => config.network.network_type.clone(),
-        };
     }
-    if let Some(url) = req.indexer_url {
-        config.indexer = Some(crate::config::IndexerConfig { url });
-    }
-    if let Some(lan) = req.lan_connect_host {
-        config.electrum_server.lan_connect_host = if lan.trim().is_empty() {
-            None
+
+    let network = config.network.network_type.clone();
+    let indexer_updated = if network_changed {
+        tracing::info!("Network changed — scanning LAN for indexer on new network");
+        let found = crate::discovery::apply_indexer_discovery(&mut config);
+        found && config.indexer.is_some()
+    } else if let Some(url) = req.indexer_url {
+        if url.trim().is_empty() {
+            if crate::discovery::is_umbrel_mode() {
+                tracing::info!("Clearing manual indexer override — reconnecting to node indexer");
+                if let Some(ref mut idx) = config.indexer {
+                    idx.manual_override = false;
+                }
+                crate::discovery::apply_indexer_discovery(&mut config)
+            } else {
+                false
+            }
         } else {
-            Some(lan.trim().to_string())
-        };
-    }
+            let normalized = crate::discovery::normalize_indexer_url_with_scheme(
+                &url,
+                req.indexer_use_ssl,
+            );
+            let working = crate::discovery::resolve_working_indexer_url(&normalized, &network)
+                .or_else(|| {
+                    crate::discovery::resolve_working_indexer_url(&url, &network)
+                })
+                .unwrap_or(normalized);
+            config.indexer = Some(crate::config::IndexerConfig {
+                url: working,
+                manual_override: true,
+            });
+            true
+        }
+    } else {
+        false
+    };
     if let Some(mode) = req.broadcast_mode {
         if let Ok(m) = mode.parse::<crate::config::BroadcastMode>() {
             config.schedule.broadcast_mode = m;
@@ -468,42 +514,16 @@ async fn save_config(
     }
     tracing::info!("Config modified");
 
-    let config_path = dirs::config_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("broadcast-pool")
-        .join("config.toml");
+    crate::discovery::save_config_to_disk(&config)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("File write error: {}", e)))?;
 
-    if let Some(parent) = config_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    let response = config_to_response(&config, network_changed);
+    let pool_manager = state.pool_manager.clone();
+    if indexer_updated {
+        if let Err(e) = pool_manager.reconnect_indexer_from_config() {
+            tracing::warn!("Could not reconnect indexer after save: {}", e);
+        }
     }
-
-    let toml_str = toml::to_string_pretty(&*config).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("TOML error: {}", e)))?;
-    std::fs::write(&config_path, &toml_str).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("File write error: {}", e)))?;
-    tracing::info!("Config saved to {:?}", config_path);
-
-    let indexer_auto = std::env::var("BROADCAST_POOL_INDEXER_URL").is_err();
-    let response = ConfigResponse {
-        indexer_url: config.indexer.as_ref().map(|e| e.url.clone()).unwrap_or_default(),
-        network: config.network.network_type.data_dir_name().to_string(),
-        broadcast_mode: config.schedule.broadcast_mode.to_string(),
-        default_delay_hours: config.schedule.default_delay_hours,
-        scheduled_datetime: config.schedule.scheduled_datetime.clone(),
-        min_delay_hours: config.schedule.min_delay_hours,
-        max_delay_hours: config.schedule.max_delay_hours,
-        min_fee_rate: config.schedule.min_fee_rate,
-        max_fee_rate: config.schedule.max_fee_rate,
-        web_port: config.web.port,
-        electrum_port: config.electrum_server.port,
-        electrum_host: config.electrum_server.host.clone(),
-        wallet_connect_url: wallet_connect_url(&config),
-        liana_connect_url: liana_connect_url(&config),
-        lan_connect_host: config.electrum_server.lan_connect_host.clone(),
-        indexer_auto_detected: indexer_auto,
-        network_changed,
-        supported_networks: supported_networks_vec(),
-    };
-    tracing::info!("Response created, about to return");
 
     drop(config);
     tracing::info!("Config lock dropped");
@@ -527,17 +547,29 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         } else {
             false
         };
-        let has_indexer = if let Some(indexer) = pool_manager.get_indexer() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let indexer_clone = indexer.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(indexer_clone.test_connection().is_ok());
-            });
-            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or(false)
-        } else {
-            false
+        let (indexer_url, network_type) = {
+            let cfg = config.lock().map_err(|e| e.to_string())?;
+            (
+                cfg.indexer.as_ref().map(|i| i.url.clone()),
+                cfg.network.network_type.clone(),
+            )
         };
-        let indexer_height = pool_manager.check_block_height().ok().flatten();
+        let has_indexer = indexer_url
+            .as_deref()
+            .map(|u| live_test_indexer_url(u, &network_type))
+            .unwrap_or(false);
+        let indexer_height = if has_indexer {
+            indexer_url.as_deref().and_then(|url| {
+                crate::discovery::resolve_working_indexer_url(url, &network_type)
+                    .and_then(|working| {
+                        crate::rpc::ElectrumClient::new(&working)
+                            .ok()
+                            .and_then(|c| c.get_height().ok())
+                    })
+            })
+        } else {
+            pool_manager.check_block_height().ok().flatten()
+        };
         let chain_mtp = pool_manager.get_chain_mtp().ok();
         let network = {
             let cfg = config.lock().map_err(|e| e.to_string())?;
@@ -547,13 +579,9 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
             let cfg = config.lock().map_err(|e| e.to_string())?;
             cfg.network.network_type.display_name().to_string()
         };
-        let (wallet_url, liana_url, lan_host) = {
+        let wallet_url = {
             let cfg = config.lock().map_err(|e| e.to_string())?;
-            (
-                wallet_connect_url(&cfg),
-                liana_connect_url(&cfg),
-                cfg.electrum_server.lan_connect_host.clone(),
-            )
+            wallet_connect_url(&cfg)
         };
         Ok::<_, String>((
             stats,
@@ -564,8 +592,6 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
             network,
             network_display,
             wallet_url,
-            liana_url,
-            lan_host,
         ))
     })
     .await
@@ -580,8 +606,6 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         network,
         network_display,
         wallet_url,
-        liana_url,
-        lan_host,
     ) = result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(StatusResponse {
@@ -595,8 +619,6 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         pool_stats,
         retain_by_default: true,
         wallet_connect_url: wallet_url,
-        liana_connect_url: liana_url,
-        lan_connect_host: lan_host,
     }))
 }
 
@@ -656,6 +678,7 @@ async fn estimate_fee(
 #[derive(Deserialize)]
 struct TestIndexerRequest {
     url: String,
+    indexer_use_ssl: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -664,65 +687,155 @@ struct TestIndexerResponse {
     url: String,
     height: Option<u64>,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    use_ssl: Option<bool>,
 }
 
 async fn test_indexer(
+    State(state): State<AppState>,
     Json(req): Json<TestIndexerRequest>,
 ) -> Result<Json<TestIndexerResponse>, (StatusCode, String)> {
-    let url = req.url.clone();
-    let url_for_error = url.clone();
-    let url_for_timeout = url.clone();
+    if req.url.trim().is_empty() {
+        return Ok(Json(TestIndexerResponse {
+            success: false,
+            url: String::new(),
+            height: None,
+            error: Some("Empty indexer URL".to_string()),
+            use_ssl: None,
+        }));
+    }
+    let input = req.url.clone();
+    let use_ssl = req.indexer_use_ssl;
+    let network = state
+        .config
+        .lock()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .network
+        .network_type
+        .clone();
+    let normalized =
+        crate::discovery::normalize_indexer_url_with_scheme(&input, use_ssl);
+    let input_for_timeout = input.clone();
 
     let response = tokio::task::spawn_blocking(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = match crate::rpc::ElectrumClient::new(&url) {
-                Ok(client) => {
-                    match client.test_connection() {
-                        Ok(true) => {
-                            let height = client.get_height().ok();
-                            TestIndexerResponse {
-                                success: true,
-                                url: url_for_error,
-                                height,
-                                error: None,
-                            }
-                        }
-                        Ok(false) => TestIndexerResponse {
-                            success: false,
-                            url: url_for_error,
-                            height: None,
-                            error: Some("Connection failed".to_string()),
-                        },
-                        Err(e) => TestIndexerResponse {
-                            success: false,
-                            url: url_for_error,
-                            height: None,
-                            error: Some(format!("Connection failed: {}", e)),
-                        },
-                    }
+            let result = if let Some(working) =
+                crate::discovery::resolve_working_indexer_url(&normalized, &network)
+                    .or_else(|| crate::discovery::resolve_working_indexer_url(&input, &network))
+            {
+                let display = crate::discovery::display_indexer_url(&working);
+                let height = crate::rpc::ElectrumClient::new(&working)
+                    .ok()
+                    .and_then(|c| c.get_height().ok());
+                TestIndexerResponse {
+                    success: true,
+                    url: display,
+                    height,
+                    error: None,
+                    use_ssl: Some(crate::discovery::indexer_url_uses_ssl(&working)),
                 }
-                Err(e) => TestIndexerResponse {
+            } else {
+                TestIndexerResponse {
                     success: false,
-                    url: url_for_error,
+                    url: input,
                     height: None,
-                    error: Some(format!("Invalid URL: {}", e)),
-                },
+                    error: Some(
+                        "Connection failed (tried TCP and SSL on ports 50001/50002)".to_string(),
+                    ),
+                    use_ssl: None,
+                }
             };
             let _ = tx.send(result);
         });
-        rx.recv_timeout(std::time::Duration::from_secs(10))
+        rx.recv_timeout(std::time::Duration::from_secs(30))
             .unwrap_or_else(|_| TestIndexerResponse {
                 success: false,
-                url: url_for_timeout,
+                url: input_for_timeout,
                 height: None,
-                error: Some("Connection timeout (10s)".to_string()),
+                error: Some("Connection timeout (30s)".to_string()),
+                use_ssl: None,
             })
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{:?}", e)))?;
 
     Ok(Json(response))
+}
+
+#[derive(Serialize)]
+struct DiscoverIndexerResponse {
+    success: bool,
+    indexer_url: String,
+    connected: bool,
+    height: Option<u64>,
+    message: String,
+}
+
+async fn discover_indexer(
+    State(state): State<AppState>,
+) -> Result<Json<DiscoverIndexerResponse>, (StatusCode, String)> {
+    let pool_manager = state.pool_manager.clone();
+    let config = state.config.clone();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<DiscoverIndexerResponse, String> {
+        let mut cfg = config.lock().map_err(|e| e.to_string())?;
+        if let Some(ref mut idx) = cfg.indexer {
+            idx.manual_override = false;
+        }
+        let found = crate::discovery::apply_indexer_discovery(&mut cfg);
+        crate::discovery::save_config_to_disk(&cfg).map_err(|e| e.to_string())?;
+
+        let url = cfg
+            .indexer
+            .as_ref()
+            .map(|i| i.url.clone())
+            .unwrap_or_default();
+        let network_type = cfg.network.network_type.clone();
+        drop(cfg);
+
+        if found && !url.is_empty() {
+            if let Err(e) = pool_manager.reconnect_indexer_from_config() {
+                tracing::warn!("Indexer discovered but reconnect failed: {}", e);
+            }
+        }
+
+        let connected = !url.is_empty() && live_test_indexer_url(&url, &network_type);
+        let height = if connected {
+            crate::discovery::resolve_working_indexer_url(&url, &network_type).and_then(|working| {
+                crate::rpc::ElectrumClient::new(&working)
+                    .ok()
+                    .and_then(|c| c.get_height().ok())
+            })
+        } else {
+            None
+        };
+
+        Ok(DiscoverIndexerResponse {
+            success: found && connected,
+            indexer_url: crate::discovery::display_indexer_url(&url),
+            connected,
+            height,
+            message: if found && connected {
+                format!(
+                    "Indexer found and connected at {}",
+                    crate::discovery::display_indexer_url(&url)
+                )
+            } else if found {
+                format!(
+                    "Indexer URL saved ({}) but connection failed",
+                    crate::discovery::display_indexer_url(&url)
+                )
+            } else {
+                "Could not find Electrs/Fulcrum on the LAN".to_string()
+            },
+        })
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {}", e)))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(result))
 }
 
 async fn restart_daemon() -> impl IntoResponse {

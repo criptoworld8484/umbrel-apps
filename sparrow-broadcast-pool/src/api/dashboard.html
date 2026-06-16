@@ -841,11 +841,7 @@
 <div class="import-form">
     <input type="text" id="import-hex" data-i18n-placeholder="import_hex" placeholder="Raw transaction hex (02000000...)" style="flex: 4;">
     <input type="text" id="import-label" data-i18n-placeholder="import_label" placeholder="Label (optional)" style="flex: 1;">
-    <select id="import-network" style="background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 16px 20px; border-radius: 12px; font-family: var(--font-mono); font-size: 16px; min-width: 120px;">
-        <option value="mainnet">Mainnet</option>
-        <option value="testnet4" selected>Testnet 4</option>
-        <option value="signet">Signet</option>
-    </select>
+    <input type="hidden" id="import-network" value="testnet4">
     <button class="btn" onclick="importTx()" data-i18n="import_btn" style="flex: 0 0 auto;">Import</button>
 </div>
                 </div>
@@ -889,12 +885,9 @@
                                     <span style="font-family: var(--font-mono); color: var(--btc);" data-i18n="cfg_connected">Connected</span>
                                 </div>
                                 <div style="font-size: 13px; color: var(--text-dim); margin-bottom: 8px;" data-i18n="cfg_wallet_hint">
-                                    Configure your wallet to connect here (Electrum server)
+                                    Configure Sparrow or Liana to connect here (Electrum server)
                                 </div>
-                                <div style="font-size: 12px; color: var(--text-dim); margin-bottom: 4px;" data-i18n="cfg_wallet_sparrow">Sparrow / general</div>
                                 <div style="font-family: var(--font-mono); font-size: 15px; color: var(--btc); padding: 10px 14px; background: var(--bg-card); border-radius: 8px; border: 1px solid var(--border); margin-bottom: 8px; cursor: pointer;" id="wallet-url" onclick="copyWalletUrl('wallet-url')" title="Click to copy">-</div>
-                                <div style="font-size: 12px; color: var(--text-dim); margin-bottom: 4px; margin-top: 8px;" data-i18n="cfg_wallet_liana">Liana (dedicated port)</div>
-                                <div style="font-family: var(--font-mono); font-size: 15px; color: var(--btc); padding: 10px 14px; background: var(--bg-card); border-radius: 8px; border: 1px solid var(--border); margin-bottom: 8px; cursor: pointer; display: none;" id="liana-url" onclick="copyWalletUrl('liana-url')" title="Click to copy">-</div>
                                 <div style="font-size: 12px; color: var(--amber); margin-bottom: 8px;" data-i18n="cfg_wallet_warning">Use your Umbrel LAN IP (same as in the browser). Do not use the electrs indexer.</div>
                                 <div style="font-size: 12px; color: var(--text-dim); margin-top: 4px;" data-i18n="cfg_wallet_url">
                                     Use this URL in your wallet server settings
@@ -903,10 +896,6 @@
                             </div>
                         </div>
                         <div class="setting-group">
-                            <label data-i18n="cfg_lan_ip">LAN IP (wallet URL)</label>
-                            <input type="text" id="cfg-lan-ip" placeholder="192.168.1.50" style="width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 16px 20px; border-radius: 12px; font-family: var(--font-mono); font-size: 16px;">
-                            <div class="setting-hint" data-i18n="cfg_lan_ip_hint">Auto-detected at startup. Override if Sparrow cannot connect (same IP as http://umbrel).</div>
-                        <div class="setting-group">
                             <label data-i18n="cfg_indexer_status">Indexer Status</label>
                             <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 16px;">
                                 <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">
@@ -914,8 +903,8 @@
                                     <span id="indexer-status-text" style="font-family: var(--font-mono); color: var(--text-dim);" data-i18n="cfg_checking">Checking...</span>
                                 </div>
                                 <div id="indexer-height" style="font-family: var(--font-mono); font-size: 14px;"></div>
-                                <div style="font-size: 12px; color: var(--text-dim); margin-top: 4px;" data-i18n="cfg_connected_to">
-                                    Connected to Electrs/Fulcrum
+                                <div id="indexer-status-hint" style="font-size: 12px; color: var(--text-dim); margin-top: 4px;" data-i18n="cfg_indexer_hint">
+                                    Backend Electrs/Fulcrum connection
                                 </div>
                             </div>
                         </div>
@@ -942,24 +931,19 @@
                             <div class="setting-hint" data-i18n="cfg_scheduled_hint">If set, overrides delay. Leave empty to use delay hours</div>
                         </div>
                         <div class="setting-group">
-                            <label data-i18n="cfg_indexer_server">Indexer Server</label>
+                            <label data-i18n="cfg_indexer_external">External Indexer (optional)</label>
                             <div style="display: flex; gap: 8px; align-items: center;">
-                                <input type="text" id="cfg-electrs" placeholder="192.168.50.26:50001" style="flex: 1;">
+                                <input type="text" id="cfg-electrs" placeholder="host:50001 or host:50002" style="flex: 1;">
                                 <button class="btn btn-outline" id="btn-test-indexer" onclick="testIndexer()" style="padding: 16px 20px; white-space: nowrap;" data-i18n="cfg_indexer_test">Test</button>
+                                <button class="btn btn-outline" id="btn-discover-indexer" onclick="discoverIndexer()" style="padding: 16px 20px; white-space: nowrap; display: none;" data-i18n="cfg_indexer_discover">Discover</button>
                             </div>
+                            <label style="display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 14px; cursor: pointer;">
+                                <input type="checkbox" id="cfg-indexer-ssl" style="width: 16px; height: 16px; accent-color: var(--btc);">
+                                <span data-i18n="cfg_indexer_ssl">Use SSL/TLS</span>
+                            </label>
                             <div class="setting-hint" id="indexer-test-result" style="margin-top: 8px; display: none;"></div>
                             <div class="setting-hint" id="indexer-auto-hint" style="margin-top: 8px; display: none;"></div>
-                            <div class="setting-hint" data-i18n="cfg_indexer_hint">Electrs/Fulcrum TCP (ports 50001 or 50002). Auto-detected at startup; override manually if needed.</div>
-                        </div>
-                        <div class="setting-group">
-                            <label data-i18n="cfg_network">Network</label>
-                            <select id="cfg-network" style="width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 16px 20px; border-radius: 12px; font-family: var(--font-mono); font-size: 16px;">
-                                <option value="mainnet">Mainnet</option>
-                                <option value="testnet4">Testnet 4</option>
-                                <option value="signet">Signet</option>
-                            </select>
-                            <div class="setting-hint" data-i18n="cfg_network_hint">Detected from Bitcoin Core at startup; override if needed</div>
-                            <div class="setting-hint" style="color: var(--amber); margin-top: 8px;" data-i18n="cfg_network_warning">&#9888; Network change requires daemon restart</div>
+                            <div class="setting-hint" id="indexer-fallback-hint" data-i18n="cfg_indexer_fallback_hint">Only if the node indexer fails — leave empty to use the node automatically.</div>
                         </div>
                         <div class="setting-group">
                             <label data-i18n="cfg_min_delay">Min Delay (hours)</label>
@@ -1211,8 +1195,12 @@
                 protocol_banner_title: 'Virtual Mempool Active',
                 protocol_banner_text: 'Transactions from your wallet are retained locally and shown as pending. Broadcast happens when the scheduler triggers (time, block, price, or immediate).',
                 cfg_default_delay: 'Default Delay (hours)', cfg_delay_hint: 'For scheduled mode, delay before broadcast',
-                cfg_indexer_server: 'Indexer Server', cfg_indexer_test: 'Test', cfg_indexer_hint: 'Electrs/Fulcrum TCP (ports 50001 or 50002). Auto-detected at startup; override manually if needed.',
-                cfg_indexer_auto: 'Auto-detected indexer',
+                cfg_indexer_server: 'Indexer Server', cfg_indexer_external: 'External Indexer (optional)', cfg_indexer_test: 'Test', cfg_indexer_discover: 'Discover',
+                cfg_indexer_hint: 'Electrs/Fulcrum TCP (ports 50001 or 50002). Auto-detected at startup; override manually if needed.',
+                cfg_indexer_fallback_hint: 'Only if the node indexer fails — leave empty to use the node automatically.',
+                cfg_indexer_ssl: 'Use SSL/TLS',
+                cfg_indexer_auto: 'Node indexer',
+                cfg_indexer_node: 'Connected to node indexer',
                 cfg_lan_ip: 'LAN IP (wallet URL)', cfg_lan_ip_hint: 'Auto-detected at startup. Override if Sparrow cannot connect (same IP as http://umbrel).',
                 cfg_wallet_sparrow: 'Sparrow / general', cfg_wallet_liana: 'Liana (dedicated port)',
                 cfg_network: 'Network', cfg_network_hint: 'Detected from Bitcoin Core at startup; override if needed', cfg_network_warning: 'Network change requires daemon restart',
@@ -1312,8 +1300,12 @@
                 protocol_banner_title: 'Mempool Virtual Activo',
                 protocol_banner_text: 'Las transacciones de tu wallet se retienen localmente y aparecen como pendientes. La transmisi\u00f3n ocurre cuando el scheduler lo dispara (tiempo, bloque, precio o inmediato).',
                 cfg_default_delay: 'Retraso Predeterminado (horas)', cfg_delay_hint: 'Para modo programado, retraso antes de transmisi\u00f3n',
-                cfg_indexer_server: 'Servidor Indexer', cfg_indexer_test: 'Probar', cfg_indexer_hint: 'Electrs/Fulcrum TCP (puertos 50001 o 50002). Auto-detectado al arrancar; override manual si hace falta.',
-                cfg_indexer_auto: 'Indexador auto-detectado',
+                cfg_indexer_server: 'Servidor Indexer', cfg_indexer_external: 'Indexador externo (opcional)', cfg_indexer_test: 'Probar', cfg_indexer_discover: 'Detectar',
+                cfg_indexer_hint: 'Electrs/Fulcrum TCP (puertos 50001 o 50002). Auto-detectado al arrancar; override manual si hace falta.',
+                cfg_indexer_fallback_hint: 'Solo si el indexador del nodo falla — dejar vac\u00edo para usar el del nodo autom\u00e1ticamente.',
+                cfg_indexer_ssl: 'Usar SSL/TLS',
+                cfg_indexer_auto: 'Indexador del nodo',
+                cfg_indexer_node: 'Conectado al indexador del nodo',
                 cfg_lan_ip: 'IP LAN (URL wallet)', cfg_lan_ip_hint: 'Auto-detectada al arrancar. Override si Sparrow no conecta (misma IP que http://umbrel).',
                 cfg_wallet_sparrow: 'Sparrow / general', cfg_wallet_liana: 'Liana (puerto dedicado)',
                 cfg_network: 'Red', cfg_network_hint: 'Detectada desde Bitcoin Core al arrancar; override si hace falta', cfg_network_warning: 'El cambio de red requiere reinicio del daemon',
@@ -1509,7 +1501,7 @@
 
         function populateNetworkSelect(selectId, selected, networks) {
             const sel = document.getElementById(selectId);
-            if (!sel) return;
+            if (!sel || sel.tagName !== 'SELECT') return;
             const list = (networks && networks.length) ? networks : Object.keys(NETWORK_LABELS);
             sel.innerHTML = list.map(n =>
                 `<option value="${n}">${NETWORK_LABELS[n] || n}</option>`
@@ -1519,6 +1511,8 @@
             }
         }
 
+        let appUmbrelMode = false;
+
         async function updateActiveNetwork() {
             try {
                 const status = await (await fetch('/api/status')).json();
@@ -1527,15 +1521,9 @@
                 const badge = document.getElementById('active-network');
                 if (badge) badge.textContent = label;
                 const importNet = document.getElementById('import-network');
-                if (importNet && !importNet.dataset.userChanged) {
-                    importNet.value = net;
-                }
+                if (importNet) importNet.value = net;
             } catch (e) { console.error(e); }
         }
-
-        document.getElementById('import-network')?.addEventListener('change', function() {
-            this.dataset.userChanged = '1';
-        });
 
         function mempoolUrl(txid, network) {
             const net = network || 'testnet4';
@@ -2204,20 +2192,21 @@
             const walletEl = document.getElementById('wallet-url');
             if (walletEl && walletUrl) walletEl.textContent = walletUrl;
 
-            const lianaEl = document.getElementById('liana-url');
-            const lianaUrl = cfg.liana_connect_url;
-            if (lianaEl) {
-                if (lianaUrl) {
-                    lianaEl.textContent = lianaUrl;
-                    lianaEl.style.display = 'block';
-                } else {
-                    lianaEl.style.display = 'none';
-                }
+            appUmbrelMode = !!cfg.umbrel_mode;
+            const discoverBtn = document.getElementById('btn-discover-indexer');
+            if (discoverBtn) {
+                discoverBtn.style.display = appUmbrelMode ? 'none' : '';
+            }
+            const fallbackHint = document.getElementById('indexer-fallback-hint');
+            if (fallbackHint) {
+                fallbackHint.style.display = appUmbrelMode ? 'block' : 'none';
             }
 
             const autoHint = document.getElementById('indexer-auto-hint');
-            if (autoHint && cfg.indexer_auto_detected && cfg.indexer_url) {
-                autoHint.textContent = `${t('cfg_indexer_auto')}: ${cfg.indexer_url}`;
+            const nodeUrl = cfg.indexer_node_url || '';
+            if (autoHint && nodeUrl) {
+                const prefix = appUmbrelMode ? t('cfg_indexer_node') : t('cfg_indexer_auto');
+                autoHint.textContent = `${prefix}: ${nodeUrl}`;
                 autoHint.style.display = 'block';
                 autoHint.style.color = 'var(--green)';
             } else if (autoHint) {
@@ -2225,13 +2214,21 @@
             }
         }
 
+        function applyIndexerConfig(cfg) {
+            document.getElementById('cfg-electrs').value = cfg.indexer_url || '';
+            const sslBox = document.getElementById('cfg-indexer-ssl');
+            if (sslBox) sslBox.checked = !!cfg.indexer_use_ssl;
+        }
+
+        function indexerSslChecked() {
+            const box = document.getElementById('cfg-indexer-ssl');
+            return box ? box.checked : false;
+        }
+
         async function loadConfig() {
             try {
                 const cfg = await (await fetch('/api/config')).json();
-                populateNetworkSelect('cfg-network', cfg.network, cfg.supported_networks);
-                populateNetworkSelect('import-network', cfg.network, cfg.supported_networks);
-                document.getElementById('cfg-electrs').value = cfg.indexer_url || '';
-                document.getElementById('cfg-lan-ip').value = cfg.lan_connect_host || '';
+                applyIndexerConfig(cfg);
                 document.getElementById('cfg-broadcast-mode').value = cfg.broadcast_mode || 'immediate';
                 document.getElementById('cfg-default-delay').value = cfg.default_delay_hours || 24;
                 if (cfg.scheduled_datetime) {
@@ -2245,12 +2242,6 @@
                 updateWalletUrls(cfg);
             } catch (e) { console.error(e); }
         }
-
-        // Update indexer URL placeholder when network changes
-        document.getElementById('cfg-network').addEventListener('change', function() {
-            const indexerInput = document.getElementById('cfg-electrs');
-            indexerInput.placeholder = 'host:50001 or host:50002';
-        });
 
         async function checkIndexerStatus() {
             try {
@@ -2308,10 +2299,17 @@
                 const res = await fetch('/api/test-indexer', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url })
+                    body: JSON.stringify({ url, indexer_use_ssl: indexerSslChecked() })
                 });
                 const data = await res.json();
                 if (data.success) {
+                    if (data.url) {
+                        document.getElementById('cfg-electrs').value = data.url;
+                    }
+                    if (data.use_ssl !== undefined) {
+                        const sslBox = document.getElementById('cfg-indexer-ssl');
+                        if (sslBox) sslBox.checked = !!data.use_ssl;
+                    }
                     if (data.height) {
                         showIndexerStatus(`Connected! Height: ${data.height}`, 'var(--green)');
                     } else {
@@ -2335,12 +2333,35 @@
             el.style.display = 'block';
         }
 
+        async function discoverIndexer() {
+            const btn = document.getElementById('btn-discover-indexer');
+            btn.disabled = true;
+            btn.textContent = 'Scanning...';
+            try {
+                const res = await fetch('/api/discover-indexer', { method: 'POST' });
+                const data = await res.json();
+                if (data.indexer_url) {
+                    document.getElementById('cfg-electrs').value = data.indexer_url;
+                }
+                const color = data.success ? 'var(--green)' : 'var(--red)';
+                showIndexerStatus(data.message, color);
+                if (data.success) {
+                    await checkIndexerStatus();
+                    await loadConfig();
+                }
+            } catch (e) {
+                showIndexerStatus(`Error: ${e.message}`, 'var(--red)');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = t('cfg_indexer_discover');
+            }
+        }
+
         async function saveConfig() {
             try {
                 const body = {
                     indexer_url: document.getElementById('cfg-electrs').value,
-                    lan_connect_host: document.getElementById('cfg-lan-ip').value,
-                    network: document.getElementById('cfg-network').value,
+                    indexer_use_ssl: indexerSslChecked(),
                     broadcast_mode: document.getElementById('cfg-broadcast-mode').value,
                     default_delay_hours: parseInt(document.getElementById('cfg-default-delay').value) || 24,
                     scheduled_datetime: document.getElementById('cfg-scheduled-datetime').value || null,
@@ -2355,10 +2376,10 @@
                 if (res.ok) {
                     toast(t('toast_saved'));
                     const cfg = await res.json();
+                    applyIndexerConfig(cfg);
                     updateWalletUrls(cfg);
-                    console.log('Config response:', cfg);
-                    if (cfg.network_changed) {
-                        console.log('Network changed detected, showing modal');
+                    await checkIndexerStatus();
+                    if (cfg.network_changed && cfg.network_editable) {
                         showNetworkRestartModal();
                     }
                 } else {
@@ -2415,8 +2436,6 @@
             }
         }
 
-        populateNetworkSelect('cfg-network', null, ['mainnet', 'testnet4', 'signet']);
-        populateNetworkSelect('import-network', null, ['mainnet', 'testnet4', 'signet']);
         refresh();
         loadConfig();
         updateActiveNetwork();

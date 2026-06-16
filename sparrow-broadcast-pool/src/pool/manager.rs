@@ -29,7 +29,7 @@ pub struct PendingTxInfo {
 pub struct PoolManager {
     db: Arc<Database>,
     rpc: Option<Arc<BitcoinRpc>>,
-    indexer: Option<Arc<ElectrumClient>>,
+    indexer: Mutex<Option<Arc<ElectrumClient>>>,
     config: Arc<Mutex<Config>>,
     pending_txs: Arc<Mutex<HashMap<String, PendingTxInfo>>>,
     mtp_cache: Arc<Mutex<Option<(Instant, u64)>>>,
@@ -46,7 +46,7 @@ impl PoolManager {
         Self {
             db,
             rpc,
-            indexer,
+            indexer: Mutex::new(indexer),
             config,
             pending_txs: Arc::new(Mutex::new(HashMap::new())),
             mtp_cache: Arc::new(Mutex::new(None)),
@@ -59,7 +59,7 @@ impl PoolManager {
     }
 
     pub fn rpc_available(&self) -> bool {
-        self.rpc.is_some() || self.indexer.is_some()
+        self.rpc.is_some() || self.get_indexer().is_some()
     }
 
     pub fn get_db(&self) -> &Arc<Database> {
@@ -196,7 +196,7 @@ impl PoolManager {
 
     pub fn broadcast_transaction(&self, tx_hex: &str) -> Result<String> {
         let mut indexer_err = None;
-        if let Some(ref indexer) = self.indexer {
+        if let Some(indexer) = self.get_indexer() {
             match indexer.broadcast_transaction(tx_hex) {
                 Ok(txid) => return Ok(txid),
                 Err(e) => {
@@ -571,7 +571,7 @@ impl PoolManager {
                 return rpc.get_median_time();
             }
         }
-        if let Some(ref indexer) = self.indexer {
+        if let Some(indexer) = self.get_indexer() {
             return indexer.get_median_time_past();
         }
         anyhow::bail!("No backend available to read median time past")
@@ -680,7 +680,7 @@ impl PoolManager {
         }
 
         // Fallback to indexer (limited confirmation checking)
-        if let Some(ref indexer) = self.indexer {
+        if let Some(indexer) = self.get_indexer() {
             if indexer.test_connection().unwrap_or(false) {
                 for tx in broadcast_txs {
                     results.push((tx.id, false, None));
@@ -871,22 +871,62 @@ impl PoolManager {
         self.rpc.as_ref()
     }
 
-    pub fn get_indexer(&self) -> Option<&Arc<ElectrumClient>> {
-        self.indexer.as_ref()
+    fn lock_indexer(&self) -> Option<std::sync::MutexGuard<'_, Option<Arc<ElectrumClient>>>> {
+        self.indexer.lock().ok()
+    }
+
+    pub fn get_indexer(&self) -> Option<Arc<ElectrumClient>> {
+        self.lock_indexer()?.clone()
+    }
+
+    pub fn set_indexer(&self, client: Option<Arc<ElectrumClient>>) {
+        if let Some(mut guard) = self.lock_indexer() {
+            *guard = client;
+        }
+    }
+
+    pub fn reconnect_indexer_from_config(&self) -> Result<()> {
+        let url = self
+            .get_indexer_url()
+            .context("No indexer URL configured")?;
+        let network = {
+            let cfg = self
+                .config
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Config lock poisoned: {}", e))?;
+            cfg.network.network_type.clone()
+        };
+        let working = crate::discovery::resolve_working_indexer_url(&url, &network)
+            .unwrap_or_else(|| url.clone());
+        if working != url {
+            if let Ok(mut cfg) = self.config.lock() {
+                cfg.indexer = Some(crate::config::IndexerConfig {
+                    url: working.clone(),
+                    manual_override: cfg
+                        .indexer
+                        .as_ref()
+                        .map(|i| i.manual_override)
+                        .unwrap_or(false),
+                });
+            }
+        }
+        let client = Arc::new(ElectrumClient::new(&working)?);
+        self.set_indexer(Some(client));
+        Ok(())
     }
 
     pub fn indexer_healthy(&self) -> bool {
-        if let Some(ref indexer) = self.indexer {
-            indexer.test_connection().is_ok()
+        if let Some(indexer) = self.get_indexer() {
+            indexer.test_connection().unwrap_or(false)
         } else if let Some(ref rpc) = self.rpc {
-            rpc.test_connection().is_ok()
+            rpc.test_connection().unwrap_or(false)
         } else {
             false
         }
     }
 
     pub fn check_block_height(&self) -> Result<Option<u64>> {
-        if let Some(ref indexer) = self.indexer {
+        if let Some(indexer) = self.get_indexer() {
             match indexer.get_block_height() {
                 Ok(height) => return Ok(Some(height)),
                 Err(e) => tracing::debug!("Indexer get_height failed: {}", e),

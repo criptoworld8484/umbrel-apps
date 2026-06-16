@@ -7,36 +7,41 @@ tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
   Broadcast Pool retiene transacciones firmadas en Sparrow Wallet y las difunde
-  a la red en el momento que elijas: inmediato, por fecha/hora, por altura de
-  bloque o por precio BTC (EUR/USD).
+  a la red en el momento que elijas: inmediato, por fecha/hora o por altura de
+  bloque.
 
 
-  Incluye un servidor Electrum integrado para que Sparrow y Liana se conecten a
-  tu nodo Umbrel sin usar indexadores externos. Las transacciones permanecen en
-  un mempool virtual local hasta que el scheduler las emite.
+  Incluye un servidor Electrum integrado para que Sparrow se conecte a tu nodo
+  Umbrel sin usar indexadores externos. Las transacciones permanecen en un
+  mempool virtual local hasta que el scheduler las emite.
 
 
   Características:
 
-  - Auto-detección de red (Bitcoin Core), indexador (50001/50002) e IP LAN
+  - Modos de envío: inmediato, programado (reloj) y por bloque
 
-  - Modos de envío: inmediato, programado, por bloque y por precio fiat
+  - Reprogramación si el MTP de cadena retrasa la emisión
 
-  - Dashboard web con wizard, mempool congestion y precio BTC en vivo
-
-  - Sparrow y Liana: IP-LAN:50050 (misma URL Electrum del pool)
+  - Dashboard web para monitorizar el pool
 
   - Soporte mainnet, testnet4 y signet (según red del nodo Bitcoin)
+
+  - Conexión automática a Bitcoin Core y Electrs de Umbrel
+
+
+  Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.2.0 — Auto-configuración y mejoras de dashboard.
+  v0.2.0 — Conexión automática al indexador del nodo Umbrel.
 
-  - Detección automática de red desde Bitcoin Core (getblockchaininfo)
+  - Red detectada desde Bitcoin Core (sin selector manual en Settings)
 
-  - Indexador Electrs/Fulcrum: prueba puertos TCP 50001 y 50002 con validación genesis
+  - Indexador del nodo conectado al arrancar; override externo opcional con SSL
 
-  - URL wallet IP-LAN:50050 para Sparrow y Liana (vía exports.sh)
+  - Descubrimiento TCP+SSL en puertos 50001/50002
 
-  - Wizard de introducción, precio BTC, congestión mempool, programación por precio
+  - Modos de broadcast y reprogramación tras fallo por MTP
+
+  - Dashboard simplificado para instalación en nodo
 developer: criptoworld8484
 website: https://github.com/criptoworld8484/umbrel-apps
 repo: https://github.com/criptoworld8484/umbrel-apps/tree/master/sparrow-broadcast-pool

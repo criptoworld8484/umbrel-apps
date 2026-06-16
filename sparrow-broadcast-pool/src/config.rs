@@ -60,6 +60,9 @@ impl std::str::FromStr for BroadcastMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexerConfig {
     pub url: String,
+    /// User-provided external indexer; when true, startup skips auto-discovery.
+    #[serde(default)]
+    pub manual_override: bool,
 }
 
 impl Config {
@@ -101,7 +104,10 @@ impl Config {
             }
         }
         if let Ok(url) = std::env::var("BROADCAST_POOL_INDEXER_URL") {
-            config.indexer = Some(IndexerConfig { url });
+            config.indexer = Some(IndexerConfig {
+                url,
+                manual_override: false,
+            });
         }
         // Indexer host/port auto-discovery runs at startup (see discovery.rs).
         if let Ok(ip) = std::env::var("BROADCAST_POOL_LAN_IP") {
@@ -168,7 +174,10 @@ impl Config {
 
         let indexer = std::env::var("BROADCAST_POOL_INDEXER_URL")
             .ok()
-            .map(|url| IndexerConfig { url });
+            .map(|url| IndexerConfig {
+                url,
+                manual_override: false,
+            });
 
         Self {
             network: NetworkConfig {

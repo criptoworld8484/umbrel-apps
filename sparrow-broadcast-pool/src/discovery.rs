@@ -2,8 +2,12 @@
 
 use crate::config::{Config, NetworkType};
 use crate::rpc::{BitcoinRpc, ElectrumClient};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
 pub const INDEXER_PORTS: [u16; 2] = [50001, 50002];
+const BROADER_PORT_RANGE: std::ops::RangeInclusive<u16> = 50000..=50010;
+const TCP_PROBE_MS: u64 = 150;
 
 /// Map Bitcoin Core `getblockchaininfo().chain` to our network type.
 pub fn network_from_bitcoin_chain(chain: &str) -> NetworkType {
@@ -83,6 +87,126 @@ pub fn strip_indexer_scheme(url: &str) -> &str {
         .unwrap_or(url)
 }
 
+/// Electrs/Fulcrum convention: 50001 = plain TCP, 50002 = TLS.
+pub fn default_scheme_for_port(port: u16) -> &'static str {
+    if port == 50002 {
+        "ssl"
+    } else {
+        "tcp"
+    }
+}
+
+/// True when running on Umbrel (node indexer available via Docker env).
+pub fn is_umbrel_mode() -> bool {
+    std::env::var("BROADCAST_POOL_UMBREL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        || std::env::var("APP_ELECTRS_NODE_IP")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+}
+
+pub fn indexer_url_uses_ssl(url: &str) -> bool {
+    url.trim().starts_with("ssl://")
+}
+
+/// Build canonical indexer URL; `use_ssl` overrides port-based scheme when set.
+pub fn normalize_indexer_url_with_scheme(raw: &str, use_ssl: Option<bool>) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("tcp://") || trimmed.starts_with("ssl://") {
+        return trimmed.to_string();
+    }
+    if let Some(ssl) = use_ssl {
+        if let Some((host, port_str)) = trimmed.rsplit_once(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                let host = host.trim();
+                if !host.is_empty() {
+                    let scheme = if ssl { "ssl" } else { "tcp" };
+                    return format!("{}://{}:{}", scheme, host, port);
+                }
+            }
+        }
+    }
+    normalize_indexer_url(trimmed)
+}
+
+/// Normalize user input to a canonical indexer URL with scheme.
+pub fn normalize_indexer_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with("tcp://") || trimmed.starts_with("ssl://") {
+        return trimmed.to_string();
+    }
+    if let Some((host, port_str)) = trimmed.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            let host = host.trim();
+            if !host.is_empty() {
+                return format!(
+                    "{}://{}:{}",
+                    default_scheme_for_port(port),
+                    host,
+                    port
+                );
+            }
+        }
+    }
+    format!("tcp://{}", trimmed)
+}
+
+/// Host:port for Settings UI (scheme omitted; port implies TCP vs SSL).
+pub fn display_indexer_url(url: &str) -> String {
+    strip_indexer_scheme(url).trim().to_string()
+}
+
+/// All TCP/SSL combinations for standard Electrs/Fulcrum ports on one host.
+/// Order per IP: 50001/tcp, 50001/ssl, 50002/tcp, 50002/ssl.
+pub fn candidate_urls_for_host(host: &str, ports: &[u16]) -> Vec<String> {
+    let mut urls = Vec::new();
+    for &port in ports {
+        urls.push(format!("tcp://{}:{}", host, port));
+        urls.push(format!("ssl://{}:{}", host, port));
+    }
+    urls
+}
+
+/// Connection attempts for a host/port (both TCP and SSL).
+pub fn candidate_urls_for_host_port(host: &str, port: u16) -> Vec<String> {
+    if port == 50002 {
+        vec![
+            format!("ssl://{}:{}", host, port),
+            format!("tcp://{}:{}", host, port),
+        ]
+    } else {
+        vec![
+            format!("tcp://{}:{}", host, port),
+            format!("ssl://{}:{}", host, port),
+        ]
+    }
+}
+
+/// Ordered URLs to try when connecting — always both TCP and SSL for host:port.
+pub fn connection_url_candidates(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let bare = strip_indexer_scheme(trimmed).trim();
+    if let Some((host, port_str)) = bare.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return candidate_urls_for_host_port(host.trim(), port);
+        }
+    }
+    if trimmed.starts_with("tcp://") || trimmed.starts_with("ssl://") {
+        return vec![trimmed.to_string()];
+    }
+    vec![format!("tcp://{}", trimmed)]
+}
+
 pub fn extract_indexer_host(url: &str) -> Option<String> {
     let bare = strip_indexer_scheme(url).trim();
     if bare.is_empty() {
@@ -96,23 +220,26 @@ pub fn extract_indexer_host(url: &str) -> Option<String> {
     }
 }
 
+fn push_unique(hosts: &mut Vec<String>, host: String) {
+    if !host.is_empty() && !hosts.contains(&host) {
+        hosts.push(host);
+    }
+}
+
+/// Known hosts in priority order: Umbrel docker IP, saved indexer host, localhost, LAN IP.
 fn indexer_host_candidates(config: &Config) -> Vec<String> {
     let mut hosts = Vec::new();
     if let Ok(h) = std::env::var("APP_ELECTRS_NODE_IP") {
-        let h = h.trim().to_string();
-        if !h.is_empty() {
-            hosts.push(h);
-        }
+        push_unique(&mut hosts, h.trim().to_string());
     }
     if let Some(ref idx) = config.indexer {
         if let Some(h) = extract_indexer_host(&idx.url) {
-            if !hosts.contains(&h) {
-                hosts.push(h);
-            }
+            push_unique(&mut hosts, h);
         }
     }
-    if hosts.is_empty() {
-        hosts.push("127.0.0.1".to_string());
+    push_unique(&mut hosts, "127.0.0.1".to_string());
+    if let Some(lan) = detect_lan_ip() {
+        push_unique(&mut hosts, lan);
     }
     hosts
 }
@@ -132,26 +259,199 @@ fn indexer_ports_to_try() -> Vec<u16> {
     ports
 }
 
-/// Probe TCP ports 50001/50002; keep indexers whose genesis matches `network`.
-pub fn discover_indexer_url(network: &NetworkType, config: &Config) -> Option<String> {
-    let ports = indexer_ports_to_try();
-    for host in indexer_host_candidates(config) {
-        for port in &ports {
-            let url = format!("tcp://{}:{}", host, port);
-            if indexer_matches_network(&url, network) {
-                tracing::info!(
-                    "Auto-detected indexer at {} (genesis matches {})",
-                    url,
-                    network.data_dir_name()
-                );
-                return Some(url);
-            }
+fn tcp_port_open(host: &str, port: u16) -> bool {
+    let addr = format!("{}:{}", host, port);
+    let Ok(addrs) = addr.to_socket_addrs() else {
+        return false;
+    };
+    let timeout = Duration::from_millis(TCP_PROBE_MS);
+    for socket_addr in addrs {
+        if TcpStream::connect_timeout(&socket_addr, timeout).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn lan_subnet_prefix(lan_ip: &str) -> Option<String> {
+    let parts: Vec<&str> = lan_ip.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    if parts.iter().all(|p| p.parse::<u8>().is_ok()) {
+        Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]))
+    } else {
+        None
+    }
+}
+
+fn lan_subnet_hosts(lan_ip: &str) -> Vec<String> {
+    let Some(prefix) = lan_subnet_prefix(lan_ip) else {
+        return Vec::new();
+    };
+    (1..=254)
+        .map(|n| format!("{}.{}", prefix, n))
+        .filter(|h| h != lan_ip)
+        .collect()
+}
+
+fn try_host(network: &NetworkType, host: &str, ports: &[u16]) -> Option<String> {
+    for url in candidate_urls_for_host(host, ports) {
+        if indexer_matches_network(&url, network) {
+            return Some(url);
         }
     }
     None
 }
 
+fn try_hosts_ports(network: &NetworkType, hosts: &[String], ports: &[u16]) -> Option<String> {
+    for host in hosts {
+        if let Some(url) = try_host(network, host, ports) {
+            tracing::info!(
+                "Auto-detected indexer at {} (genesis matches {})",
+                display_indexer_url(&url),
+                network.data_dir_name()
+            );
+            return Some(url);
+        }
+    }
+    None
+}
+
+fn lan_subnets_to_scan(config: &Config) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    if let Ok(ip) = std::env::var("BROADCAST_POOL_LAN_IP") {
+        if let Some(p) = lan_subnet_prefix(ip.trim()) {
+            push_unique(&mut prefixes, p);
+        }
+    }
+    if let Some(ref idx) = config.indexer {
+        if let Some(h) = extract_indexer_host(&idx.url) {
+            if let Some(p) = lan_subnet_prefix(&h) {
+                push_unique(&mut prefixes, p);
+            }
+        }
+    }
+    if let Some(ip) = detect_lan_ip() {
+        if !is_likely_docker_bridge(&ip) {
+            if let Some(p) = lan_subnet_prefix(&ip) {
+                push_unique(&mut prefixes, p);
+            }
+        }
+    }
+    prefixes
+}
+
+fn hosts_with_open_ports_on(prefix: &str, ports: &[u16]) -> Vec<String> {
+    (1..=254)
+        .filter_map(|n| {
+            let host = format!("{}.{}", prefix, n);
+            if ports.iter().any(|p| tcp_port_open(&host, *p)) {
+                Some(host)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn scan_subnet_for_indexer(
+    network: &NetworkType,
+    prefix: &str,
+    ports: &[u16],
+) -> Option<String> {
+    tracing::info!(
+        "Scanning LAN subnet {}.x for indexer (ports {:?}, tcp+ssl)",
+        prefix,
+        ports
+    );
+    let responsive = hosts_with_open_ports_on(prefix, ports);
+    tracing::info!(
+        "Subnet {}.x: {} host(s) with open indexer port(s)",
+        prefix,
+        responsive.len()
+    );
+    try_hosts_ports(network, &responsive, ports)
+}
+
+fn hosts_with_broader_ports_subnet(prefix: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    'host: for n in 1..=254 {
+        let host = format!("{}.{}", prefix, n);
+        for port in BROADER_PORT_RANGE {
+            if tcp_port_open(&host, port) {
+                push_unique(&mut found, host);
+                continue 'host;
+            }
+        }
+    }
+    found
+}
+
+/// Probe TCP+SSL on ports 50001/50002: known hosts, then each LAN subnet, then broader ports.
+pub fn discover_indexer_url(network: &NetworkType, config: &Config) -> Option<String> {
+    let standard_ports = indexer_ports_to_try();
+
+    tracing::info!("Indexer discovery phase 1: known hosts (tcp+ssl on {:?})", standard_ports);
+    if let Some(url) = try_hosts_ports(network, &indexer_host_candidates(config), &standard_ports) {
+        return Some(url);
+    }
+
+    let subnets = lan_subnets_to_scan(config);
+    if subnets.is_empty() {
+        tracing::warn!("No LAN subnet available for indexer scan — set BROADCAST_POOL_LAN_IP");
+    }
+    for prefix in &subnets {
+        if let Some(url) = scan_subnet_for_indexer(network, prefix, &standard_ports) {
+            return Some(url);
+        }
+    }
+
+    tracing::info!("Indexer discovery phase 3: broader ports 50000–50010 (tcp+ssl)");
+    for prefix in &subnets {
+        let responsive = hosts_with_broader_ports_subnet(prefix);
+        let broader_ports: Vec<u16> = BROADER_PORT_RANGE.collect();
+        if let Some(url) = try_hosts_ports(network, &responsive, &broader_ports) {
+            return Some(url);
+        }
+    }
+
+    None
+}
+
+/// Find a working indexer URL trying TCP and SSL on the given host:port.
+pub fn resolve_working_indexer_url(raw: &str, network: &NetworkType) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.starts_with("tcp://") || trimmed.starts_with("ssl://") {
+        if indexer_matches_network(trimmed, network) {
+            return Some(trimmed.to_string());
+        }
+        let bare = strip_indexer_scheme(trimmed);
+        if let Some((host, port_str)) = bare.rsplit_once(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                return try_host(network, host.trim(), &[port]);
+            }
+        }
+        return None;
+    }
+
+    if let Some((host, port_str)) = trimmed.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return try_host(network, host.trim(), &[port]);
+        }
+    }
+
+    None
+}
+
 fn indexer_matches_network(url: &str, network: &NetworkType) -> bool {
+    if !tcp_reachable_from_url(url) {
+        return false;
+    }
     let client = match ElectrumClient::new(url) {
         Ok(c) => c,
         Err(_) => return false,
@@ -160,6 +460,17 @@ fn indexer_matches_network(url: &str, network: &NetworkType) -> bool {
         return false;
     }
     client.genesis_matches_network(network).unwrap_or(false)
+}
+
+fn tcp_reachable_from_url(url: &str) -> bool {
+    let bare = strip_indexer_scheme(url).trim();
+    let Some((host, port_str)) = bare.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(port) = port_str.parse::<u16>() else {
+        return false;
+    };
+    tcp_port_open(host, port)
 }
 
 /// Sync network from Bitcoin Core when RPC is available.
@@ -192,40 +503,77 @@ pub fn apply_network_from_rpc(config: &mut Config, rpc: Option<&BitcoinRpc>) {
 }
 
 /// Discover indexer unless explicitly pinned via env or saved manual URL.
-pub fn apply_indexer_discovery(config: &mut Config) {
+pub fn apply_indexer_discovery(config: &mut Config) -> bool {
     if std::env::var("BROADCAST_POOL_INDEXER_URL").is_ok() {
         tracing::debug!("Indexer URL pinned by BROADCAST_POOL_INDEXER_URL");
-        return;
+        return config.indexer.is_some();
     }
 
     let network = config.network.network_type.clone();
-    if let Some(url) = discover_indexer_url(&network, config) {
-        config.indexer = Some(crate::config::IndexerConfig { url });
-        return;
+
+    if config
+        .indexer
+        .as_ref()
+        .is_some_and(|i| i.manual_override)
+    {
+        let raw = config.indexer.as_ref().unwrap().url.clone();
+        if let Some(working) = resolve_working_indexer_url(&raw, &network) {
+            config.indexer = Some(crate::config::IndexerConfig {
+                url: working.clone(),
+                manual_override: true,
+            });
+            tracing::info!(
+                "Manual indexer override validated: {}",
+                display_indexer_url(&working)
+            );
+            return true;
+        }
+        tracing::warn!(
+            "Manual indexer {} unreachable — trying node auto-discovery",
+            display_indexer_url(&raw)
+        );
     }
 
-    if config.indexer.is_some() {
-        let url = config.indexer.as_ref().unwrap().url.clone();
-        if indexer_matches_network(&url, &network) {
-            tracing::info!("Existing indexer URL validated: {}", url);
-            return;
+    if let Some(url) = discover_indexer_url(&network, config) {
+        config.indexer = Some(crate::config::IndexerConfig {
+            url,
+            manual_override: false,
+        });
+        return true;
+    }
+
+    if config.indexer.is_some() && !config.indexer.as_ref().unwrap().manual_override {
+        let raw = config.indexer.as_ref().unwrap().url.clone();
+        if let Some(working) = resolve_working_indexer_url(&raw, &network) {
+            config.indexer = Some(crate::config::IndexerConfig {
+                url: working.clone(),
+                manual_override: false,
+            });
+            tracing::info!(
+                "Existing indexer URL validated: {}",
+                display_indexer_url(&working)
+            );
+            return true;
         }
         tracing::warn!(
             "Configured indexer {} does not match Bitcoin network {} — trying auto-discovery",
-            url,
+            display_indexer_url(&raw),
             network.data_dir_name()
         );
         if let Some(found) = discover_indexer_url(&network, config) {
-            config.indexer = Some(crate::config::IndexerConfig { url: found });
+            config.indexer = Some(crate::config::IndexerConfig {
+                url: found,
+                manual_override: false,
+            });
+            return true;
         }
-    } else if let Some(found) = discover_indexer_url(&network, config) {
-        config.indexer = Some(crate::config::IndexerConfig { url: found });
-    } else {
+    } else if config.indexer.is_none() {
         tracing::warn!(
             "Could not auto-detect Electrs/Fulcrum on ports {:?} — configure indexer manually",
             indexer_ports_to_try()
         );
     }
+    false
 }
 
 pub fn apply_lan_ip(config: &mut Config) {
@@ -242,9 +590,25 @@ pub fn apply_lan_ip(config: &mut Config) {
         config.electrum_server.lan_connect_host = Some(ip);
     } else {
         tracing::warn!(
-            "Could not detect LAN IP — set BROADCAST_POOL_LAN_IP or configure in Settings"
+            "Could not detect LAN IP — set BROADCAST_POOL_LAN_IP env var"
         );
     }
+}
+
+pub fn save_config_to_disk(config: &Config) -> anyhow::Result<()> {
+    let config_path = dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("broadcast-pool")
+        .join("config.toml");
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let toml_str = toml::to_string_pretty(config)?;
+    std::fs::write(&config_path, toml_str)?;
+    tracing::info!("Config saved to {:?}", config_path);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -268,5 +632,74 @@ mod tests {
             extract_indexer_host("192.168.1.10:50001").as_deref(),
             Some("192.168.1.10")
         );
+    }
+
+    #[test]
+    fn lan_subnet_hosts_excludes_self() {
+        let hosts = lan_subnet_hosts("192.168.1.50");
+        assert!(!hosts.contains(&"192.168.1.50".to_string()));
+        assert!(hosts.contains(&"192.168.1.1".to_string()));
+    }
+
+    #[test]
+    fn normalize_indexer_url_with_explicit_ssl() {
+        assert_eq!(
+            normalize_indexer_url_with_scheme("192.168.1.10:50001", Some(true)),
+            "ssl://192.168.1.10:50001"
+        );
+        assert_eq!(
+            normalize_indexer_url_with_scheme("192.168.1.10:50002", Some(false)),
+            "tcp://192.168.1.10:50002"
+        );
+    }
+
+    #[test]
+    fn normalizes_indexer_url_by_port() {
+        assert_eq!(
+            normalize_indexer_url("192.168.50.97:50002"),
+            "ssl://192.168.50.97:50002"
+        );
+        assert_eq!(
+            normalize_indexer_url("192.168.50.97:50001"),
+            "tcp://192.168.50.97:50001"
+        );
+        assert_eq!(
+            display_indexer_url("ssl://192.168.50.97:50002"),
+            "192.168.50.97:50002"
+        );
+    }
+
+    #[test]
+    fn candidate_urls_try_ssl_first_on_50002() {
+        let urls = candidate_urls_for_host_port("192.168.50.97", 50002);
+        assert_eq!(urls[0], "ssl://192.168.50.97:50002");
+        assert_eq!(urls[1], "tcp://192.168.50.97:50002");
+    }
+
+    #[test]
+    fn connection_candidates_expand_stored_tcp_url() {
+        let urls = connection_url_candidates("tcp://192.168.50.97:50002");
+        assert_eq!(urls.len(), 2);
+        assert!(urls.contains(&"ssl://192.168.50.97:50002".to_string()));
+        assert!(urls.contains(&"tcp://192.168.50.97:50002".to_string()));
+    }
+
+    #[test]
+    fn candidate_urls_try_tcp_and_ssl_on_both_ports() {
+        let urls = candidate_urls_for_host("192.168.50.97", &INDEXER_PORTS);
+        assert_eq!(urls.len(), 4);
+        assert_eq!(urls[0], "tcp://192.168.50.97:50001");
+        assert_eq!(urls[1], "ssl://192.168.50.97:50001");
+        assert_eq!(urls[2], "tcp://192.168.50.97:50002");
+        assert_eq!(urls[3], "ssl://192.168.50.97:50002");
+    }
+
+    #[test]
+    fn lan_subnets_from_lan_ip_env() {
+        std::env::set_var("BROADCAST_POOL_LAN_IP", "192.168.50.26");
+        let cfg = crate::config::Config::default_config();
+        let subnets = lan_subnets_to_scan(&cfg);
+        assert!(subnets.contains(&"192.168.50".to_string()));
+        std::env::remove_var("BROADCAST_POOL_LAN_IP");
     }
 }
