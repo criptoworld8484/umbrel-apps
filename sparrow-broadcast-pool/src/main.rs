@@ -367,8 +367,13 @@ async fn main() -> Result<()> {
 
     // Auto-detect network (Bitcoin RPC), indexer (50001/50002), and LAN IP for wallet URL.
     discovery::apply_network_from_rpc(&mut config, rpc.as_deref());
-    discovery::apply_indexer_discovery(&mut config);
+    let indexer_found = discovery::apply_indexer_discovery(&mut config);
     discovery::apply_lan_ip(&mut config);
+    if indexer_found {
+        if let Err(e) = discovery::save_config_to_disk(&config) {
+            tracing::warn!("Could not persist indexer config: {}", e);
+        }
+    }
 
     if let Some(ref url) = config.indexer.as_ref().map(|i| i.url.as_str()) {
         tracing::info!("Indexer: {}", url);

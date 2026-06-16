@@ -228,6 +228,9 @@ fn push_unique(hosts: &mut Vec<String>, host: String) {
 
 /// Known hosts in priority order: Umbrel docker IP, saved indexer host, localhost, LAN IP.
 fn indexer_host_candidates(config: &Config) -> Vec<String> {
+    if is_umbrel_mode() {
+        return umbrel_indexer_hosts();
+    }
     let mut hosts = Vec::new();
     if let Ok(h) = std::env::var("APP_ELECTRS_NODE_IP") {
         push_unique(&mut hosts, h.trim().to_string());
@@ -244,7 +247,100 @@ fn indexer_host_candidates(config: &Config) -> Vec<String> {
     hosts
 }
 
+fn umbrel_indexer_hosts() -> Vec<String> {
+    let mut hosts = Vec::new();
+    if let Ok(h) = std::env::var("APP_ELECTRS_NODE_IP") {
+        push_unique(&mut hosts, h.trim().to_string());
+    }
+    push_unique(&mut hosts, "electrs".to_string());
+    hosts
+}
+
+fn umbrel_indexer_ports() -> Vec<u16> {
+    let mut ports = Vec::new();
+    if let Ok(p) = std::env::var("APP_ELECTRS_NODE_PORT") {
+        if let Ok(n) = p.parse::<u16>() {
+            ports.push(n);
+        }
+    }
+    if let Ok(p) = std::env::var("APP_ELECTRS_NODE_SSL_PORT") {
+        if let Ok(n) = p.parse::<u16>() {
+            ports.push(n);
+        }
+    }
+    for p in INDEXER_PORTS {
+        if !ports.contains(&p) {
+            ports.push(p);
+        }
+    }
+    ports
+}
+
+/// Connect only to the Umbrel electrs container (never LAN scan).
+pub fn discover_umbrel_node_indexer(network: &NetworkType) -> Option<String> {
+    let hosts = umbrel_indexer_hosts();
+    let ports = umbrel_indexer_ports();
+    if let Ok(ip) = std::env::var("APP_ELECTRS_NODE_IP") {
+        tracing::info!(
+            "Umbrel electrs discovery at {} (ports {:?}, tcp+ssl)",
+            ip.trim(),
+            ports
+        );
+    } else {
+        tracing::warn!(
+            "APP_ELECTRS_NODE_IP is not set — ensure Electrs is installed and listed as a dependency"
+        );
+    }
+    if hosts.is_empty() {
+        return None;
+    }
+    try_hosts_ports(network, &hosts, &ports)
+}
+
+/// Manual override to the node's wallet LAN IP cannot work from inside the Umbrel container.
+pub fn is_mistaken_umbrel_lan_override(host: &str) -> bool {
+    if !is_umbrel_mode() {
+        return false;
+    }
+    let host = host.trim();
+    if host.is_empty() {
+        return false;
+    }
+    let node_ip = std::env::var("APP_ELECTRS_NODE_IP")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !node_ip.is_empty() && host == node_ip {
+        return false;
+    }
+    if let Ok(lan) = std::env::var("BROADCAST_POOL_LAN_IP") {
+        if host == lan.trim() {
+            return true;
+        }
+    }
+    detect_lan_ip().as_deref() == Some(host)
+}
+
+fn clear_mistaken_umbrel_lan_override(config: &mut Config) {
+    let mistaken = config.indexer.as_ref().and_then(|idx| {
+        if !idx.manual_override {
+            return None;
+        }
+        extract_indexer_host(&idx.url).filter(|h| is_mistaken_umbrel_lan_override(h))
+    });
+    if let Some(host) = mistaken {
+        tracing::info!(
+            "Removing mistaken Umbrel indexer override at {} (wallet LAN — use APP_ELECTRS_NODE_IP instead)",
+            host
+        );
+        config.indexer = None;
+    }
+}
+
 fn indexer_ports_to_try() -> Vec<u16> {
+    if is_umbrel_mode() {
+        return umbrel_indexer_ports();
+    }
     let mut ports = Vec::new();
     if let Ok(p) = std::env::var("APP_ELECTRS_NODE_PORT") {
         if let Ok(n) = p.parse::<u16>() {
@@ -390,6 +486,10 @@ fn hosts_with_broader_ports_subnet(prefix: &str) -> Vec<String> {
 
 /// Probe TCP+SSL on ports 50001/50002: known hosts, then each LAN subnet, then broader ports.
 pub fn discover_indexer_url(network: &NetworkType, config: &Config) -> Option<String> {
+    if is_umbrel_mode() {
+        return discover_umbrel_node_indexer(network);
+    }
+
     let standard_ports = indexer_ports_to_try();
 
     tracing::info!("Indexer discovery phase 1: known hosts (tcp+ssl on {:?})", standard_ports);
@@ -510,6 +610,26 @@ pub fn apply_indexer_discovery(config: &mut Config) -> bool {
     }
 
     let network = config.network.network_type.clone();
+
+    if is_umbrel_mode() {
+        clear_mistaken_umbrel_lan_override(config);
+        if !config
+            .indexer
+            .as_ref()
+            .is_some_and(|i| i.manual_override)
+        {
+            if let Some(url) = discover_umbrel_node_indexer(&network) {
+                config.indexer = Some(crate::config::IndexerConfig {
+                    url,
+                    manual_override: false,
+                });
+                return true;
+            }
+            tracing::warn!(
+                "Could not reach Umbrel electrs (APP_ELECTRS_NODE_IP) — check Electrs is running"
+            );
+        }
+    }
 
     if config
         .indexer
@@ -651,6 +771,18 @@ mod tests {
             normalize_indexer_url_with_scheme("192.168.1.10:50002", Some(false)),
             "tcp://192.168.1.10:50002"
         );
+    }
+
+    #[test]
+    fn mistaken_umbrel_lan_override_detects_wallet_ip() {
+        std::env::set_var("BROADCAST_POOL_UMBREL", "1");
+        std::env::set_var("BROADCAST_POOL_LAN_IP", "192.168.50.26");
+        std::env::set_var("APP_ELECTRS_NODE_IP", "10.21.21.9");
+        assert!(is_mistaken_umbrel_lan_override("192.168.50.26"));
+        assert!(!is_mistaken_umbrel_lan_override("10.21.21.9"));
+        std::env::remove_var("BROADCAST_POOL_UMBREL");
+        std::env::remove_var("BROADCAST_POOL_LAN_IP");
+        std::env::remove_var("APP_ELECTRS_NODE_IP");
     }
 
     #[test]

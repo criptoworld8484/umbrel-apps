@@ -15,7 +15,7 @@ services:
     command: ["sh", "-c", "mkdir -p /data && chown -R 1000:1000 /data && chmod 755 /data"]
 
   web:
-    image: ghcr.io/criptoworld8484/broadcast-pool-umbrel:0.2.0
+    image: ghcr.io/criptoworld8484/broadcast-pool-umbrel:0.2.1
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
@@ -32,8 +32,9 @@ services:
       BROADCAST_POOL_RPC_URL: "http://${APP_BITCOIN_NODE_IP}:${APP_BITCOIN_RPC_PORT}"
       BROADCAST_POOL_RPC_USER: "${APP_BITCOIN_RPC_USER}"
       BROADCAST_POOL_RPC_PASS: "${APP_BITCOIN_RPC_PASS}"
-      APP_ELECTRS_NODE_IP: "${APP_ELECTRS_NODE_IP}"
-      APP_ELECTRS_NODE_PORT: "${APP_ELECTRS_NODE_PORT}"
+      APP_ELECTRS_NODE_IP: $APP_ELECTRS_NODE_IP
+      APP_ELECTRS_NODE_PORT: $APP_ELECTRS_NODE_PORT
+      APP_ELECTRS_NODE_SSL_PORT: $APP_ELECTRS_NODE_SSL_PORT
       BROADCAST_POOL_LAN_IP: "${APP_SPARROW_BROADCAST_POOL_LAN_IP:-}"
       BROADCAST_POOL_UMBREL: "1"
       BROADCAST_POOL_WEB_HOST: "0.0.0.0"

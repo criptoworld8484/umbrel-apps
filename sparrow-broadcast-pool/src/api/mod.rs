@@ -471,6 +471,16 @@ async fn save_config(
                 false
             }
         } else {
+            if let Some(host) = crate::discovery::extract_indexer_host(&url) {
+                if crate::discovery::is_mistaken_umbrel_lan_override(&host) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "On Umbrel use the node indexer automatically. Clear the external field and Save — \
+                         the wallet LAN IP is for Sparrow, not electrs from this container."
+                            .to_string(),
+                    ));
+                }
+            }
             let normalized = crate::discovery::normalize_indexer_url_with_scheme(
                 &url,
                 req.indexer_use_ssl,
@@ -547,28 +557,20 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         } else {
             false
         };
-        let (indexer_url, network_type) = {
-            let cfg = config.lock().map_err(|e| e.to_string())?;
-            (
-                cfg.indexer.as_ref().map(|i| i.url.clone()),
-                cfg.network.network_type.clone(),
-            )
-        };
-        let has_indexer = indexer_url
-            .as_deref()
-            .map(|u| live_test_indexer_url(u, &network_type))
-            .unwrap_or(false);
-        let indexer_height = if has_indexer {
-            indexer_url.as_deref().and_then(|url| {
-                crate::discovery::resolve_working_indexer_url(url, &network_type)
-                    .and_then(|working| {
-                        crate::rpc::ElectrumClient::new(&working)
-                            .ok()
-                            .and_then(|c| c.get_height().ok())
-                    })
-            })
+        let electrum_connected = if let Some(indexer) = pool_manager.get_indexer() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let idx = indexer.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(idx.test_connection().unwrap_or(false));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(8)).unwrap_or(false)
         } else {
+            false
+        };
+        let indexer_height = if electrum_connected {
             pool_manager.check_block_height().ok().flatten()
+        } else {
+            None
         };
         let chain_mtp = pool_manager.get_chain_mtp().ok();
         let network = {
@@ -586,7 +588,7 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         Ok::<_, String>((
             stats,
             rpc_connected,
-            has_indexer,
+            electrum_connected,
             indexer_height,
             chain_mtp,
             network,
@@ -703,6 +705,21 @@ async fn test_indexer(
             error: Some("Empty indexer URL".to_string()),
             use_ssl: None,
         }));
+    }
+    if let Some(host) = crate::discovery::extract_indexer_host(&req.url) {
+        if crate::discovery::is_mistaken_umbrel_lan_override(&host) {
+            return Ok(Json(TestIndexerResponse {
+                success: false,
+                url: req.url.clone(),
+                height: None,
+                error: Some(
+                    "On Umbrel the node indexer connects automatically. Clear this field and Save — \
+                     the wallet LAN IP (for Sparrow) is not reachable as electrs from this app."
+                        .to_string(),
+                ),
+                use_ssl: None,
+            }));
+        }
     }
     let input = req.url.clone();
     let use_ssl = req.indexer_use_ssl;

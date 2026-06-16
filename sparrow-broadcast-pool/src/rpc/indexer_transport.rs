@@ -118,7 +118,7 @@ fn connect_stream(url: &str) -> Result<TransportStream> {
     let addr = strip_scheme(url);
     let tcp = TcpStream::connect_timeout(
         &addr.parse().context("Invalid indexer address")?,
-        Duration::from_secs(10),
+        Duration::from_secs(5),
     )
     .with_context(|| format!("TCP connect failed ({})", addr))?;
     tcp.set_read_timeout(Some(Duration::from_secs(15)))?;
