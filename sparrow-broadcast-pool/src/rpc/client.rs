@@ -97,6 +97,15 @@ impl BitcoinRpc {
         Ok(info.chain.to_string())
     }
 
+    /// Genesis block hash from the connected node (handles custom signets on Umbrel).
+    pub fn get_genesis_block_hash(&self) -> Result<String> {
+        let hash = self
+            .client
+            .get_block_hash(0)
+            .context("Failed to get genesis block hash")?;
+        Ok(hash.to_string().to_lowercase())
+    }
+
     pub fn get_median_time(&self) -> Result<u64> {
         let info = self
             .client

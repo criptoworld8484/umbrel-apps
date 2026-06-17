@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.2.5"
+version: "0.2.6"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,15 +31,11 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.2.5 — Fix Umbrel electrs connection (TCP-only, correct RPC probe).
+  v0.2.6 — Fix signet indexer: genesis from server.features + Bitcoin Core RPC.
 
-  - server.version probe uses required client name + protocol params
+  - Match electrs genesis_hash against getblockhash(0) from your node
 
-  - Skip SSL probes when Umbrel electrs has no TLS port (plain TCP on 50001)
-
-  - Warn logs distinguish TCP refused vs genesis/network mismatch (signet hint)
-
-  - v0.2.4: faster status polls, /api/indexer-debug, background electrs retry
+  - UI shows genesis mismatch instead of misleading TCP refused
 developer: criptoworld8484
 website: https://github.com/criptoworld8484/umbrel-apps
 repo: https://github.com/criptoworld8484/umbrel-apps/tree/master/sparrow-broadcast-pool

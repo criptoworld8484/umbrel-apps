@@ -139,15 +139,39 @@ impl ElectrumClient {
     }
 
     pub fn genesis_block_hash(&self) -> Result<String> {
-        use bitcoin::hashes::{sha256d, Hash};
-        let header_hex = self
-            .rpc("blockchain.block.header", serde_json::json!([0]))?
-            .as_str()
-            .context("Unexpected genesis header format")?
-            .to_string();
+        let url = self.working_url()?;
+        Self::genesis_block_hash_at_url(&url)
+    }
+
+    /// Read genesis hash from electrs without resolving transport again.
+    pub fn genesis_block_hash_at_url(url: &str) -> Result<String> {
+        if let Ok(features) =
+            crate::rpc::indexer_transport::json_rpc(url, "server.features", serde_json::json!([]))
+        {
+            if let Some(gh) = features
+                .get("genesis_hash")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_lowercase())
+            {
+                if !gh.is_empty() {
+                    return Ok(gh);
+                }
+            }
+        }
+
+        use bitcoin::consensus::Decodable;
+        let header_hex = crate::rpc::indexer_transport::json_rpc(
+            url,
+            "blockchain.block.header",
+            serde_json::json!([0]),
+        )?
+        .as_str()
+        .context("Unexpected genesis header format")?
+        .to_string();
         let raw = hex::decode(header_hex).context("Invalid genesis header hex")?;
-        let hash = bitcoin::BlockHash::from_raw_hash(sha256d::Hash::hash(&raw));
-        Ok(hash.to_string().to_lowercase())
+        let header = bitcoin::block::Header::consensus_decode(&mut raw.as_slice())
+            .context("Failed to decode genesis header")?;
+        Ok(header.block_hash().to_string().to_lowercase())
     }
 
     pub fn genesis_matches_network(
@@ -155,8 +179,14 @@ impl ElectrumClient {
         network: &crate::config::NetworkType,
     ) -> Result<bool> {
         let actual = self.genesis_block_hash()?;
-        let expected = network.genesis_hash().to_lowercase();
-        Ok(actual == expected)
+        Ok(actual == crate::discovery::expected_genesis_hash(network))
+    }
+
+    pub fn genesis_matches_network_at_url(url: &str, network: &crate::config::NetworkType) -> bool {
+        let Ok(actual) = Self::genesis_block_hash_at_url(url) else {
+            return false;
+        };
+        actual == crate::discovery::expected_genesis_hash(network)
     }
 
     pub fn get_median_time_past(&self) -> Result<u64> {

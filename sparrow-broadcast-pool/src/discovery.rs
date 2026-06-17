@@ -25,6 +25,29 @@ pub fn network_from_bitcoin_chain(chain: &str) -> NetworkType {
     }
 }
 
+/// Expected genesis hash: from Bitcoin Core on Umbrel (supports custom signets), else built-in.
+pub fn expected_genesis_hash(network: &NetworkType) -> String {
+    if let Some(gh) = bitcoin_rpc_genesis_hash() {
+        return gh;
+    }
+    network.genesis_hash().to_lowercase()
+}
+
+fn bitcoin_rpc_genesis_hash() -> Option<String> {
+    let url = std::env::var("BROADCAST_POOL_RPC_URL").ok()?;
+    let user = std::env::var("BROADCAST_POOL_RPC_USER").ok()?;
+    let pass = std::env::var("BROADCAST_POOL_RPC_PASS").ok()?;
+    let config = crate::config::BitcoinRpcConfig {
+        url,
+        user,
+        password: pass,
+    };
+    BitcoinRpc::new(&config)
+        .ok()?
+        .get_genesis_block_hash()
+        .ok()
+}
+
 /// Best-effort LAN IP (same heuristic as Umbrel DEVICE_IP).
 pub fn detect_lan_ip() -> Option<String> {
     if let Ok(ip) = std::env::var("BROADCAST_POOL_LAN_IP") {
@@ -485,14 +508,19 @@ fn umbrel_electrs_probe_failure(network: &NetworkType) -> Option<HostProbeFailur
     if hosts.is_empty() {
         return None;
     }
-    let mut last = HostProbeFailure::TcpRefused;
+    let mut saw_genesis_mismatch = false;
     for host in &hosts {
         match try_host(network, host, &ports) {
             Ok(_) => return None,
-            Err(failure) => last = failure,
+            Err(HostProbeFailure::GenesisMismatch) => saw_genesis_mismatch = true,
+            Err(HostProbeFailure::TcpRefused) => {}
         }
     }
-    Some(last)
+    if saw_genesis_mismatch {
+        Some(HostProbeFailure::GenesisMismatch)
+    } else {
+        Some(HostProbeFailure::TcpRefused)
+    }
 }
 
 fn network_mismatch_hint(network: &NetworkType) -> &'static str {
@@ -674,11 +702,7 @@ fn probe_indexer_url(url: &str, network: &NetworkType) -> IndexerProbeOutcome {
     if crate::rpc::indexer_transport::probe_working_url(&[url.to_string()]).is_none() {
         return IndexerProbeOutcome::RpcFailed;
     }
-    let client = match ElectrumClient::new(url) {
-        Ok(c) => c,
-        Err(_) => return IndexerProbeOutcome::RpcFailed,
-    };
-    if client.genesis_matches_network(network).unwrap_or(false) {
+    if ElectrumClient::genesis_matches_network_at_url(url, network) {
         IndexerProbeOutcome::Ok
     } else {
         IndexerProbeOutcome::GenesisMismatch
@@ -756,7 +780,7 @@ fn try_host(network: &NetworkType, host: &str, ports: &[u16]) -> Result<String, 
 }
 
 fn try_hosts_ports(network: &NetworkType, hosts: &[String], ports: &[u16]) -> Option<String> {
-    let mut last_failure = HostProbeFailure::TcpRefused;
+    let mut saw_genesis_mismatch = false;
     for host in hosts {
         match try_host(network, host, ports) {
             Ok(url) => {
@@ -767,23 +791,21 @@ fn try_hosts_ports(network: &NetworkType, hosts: &[String], ports: &[u16]) -> Op
                 );
                 return Some(url);
             }
-            Err(failure) => last_failure = failure,
+            Err(HostProbeFailure::GenesisMismatch) => saw_genesis_mismatch = true,
+            Err(HostProbeFailure::TcpRefused) => {}
         }
     }
     if is_umbrel_mode() {
-        match last_failure {
-            HostProbeFailure::GenesisMismatch => {
-                tracing::warn!(
-                    "Umbrel electrs reachable but wrong network — expected {}, verify Electrs matches Bitcoin Core",
-                    network.data_dir_name()
-                );
-            }
-            HostProbeFailure::TcpRefused => {
-                tracing::warn!(
-                    "Umbrel electrs unreachable (TCP refused on ports {:?}) — ensure Electrs container is running and APP_ELECTRS_NODE_IP is correct",
-                    ports
-                );
-            }
+        if saw_genesis_mismatch {
+            tracing::warn!(
+                "Umbrel electrs reachable but wrong network — expected {}, verify Electrs matches Bitcoin Core",
+                network.data_dir_name()
+            );
+        } else {
+            tracing::warn!(
+                "Umbrel electrs unreachable (TCP refused on ports {:?}) — ensure Electrs container is running and APP_ELECTRS_NODE_IP is correct",
+                ports
+            );
         }
     }
     None
@@ -927,14 +949,10 @@ fn indexer_matches_network(url: &str, network: &NetworkType) -> bool {
     if !tcp_reachable_from_url(url) {
         return false;
     }
-    let client = match ElectrumClient::new(url) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    if !client.test_connection().unwrap_or(false) {
+    if !crate::rpc::indexer_transport::probe_working_url(&[url.to_string()]).is_some() {
         return false;
     }
-    client.genesis_matches_network(network).unwrap_or(false)
+    ElectrumClient::genesis_matches_network_at_url(url, network)
 }
 
 fn tcp_reachable_from_url(url: &str) -> bool {
