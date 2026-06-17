@@ -199,23 +199,58 @@ struct JsonRpcRequest {
 }
 
 /// Parse `blockchain.transaction.broadcast` even when strict struct decode would fail.
-fn extract_broadcast_hex(line: &str) -> Option<(serde_json::Value, String)> {
-    let v = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+/// Supports single requests, batch arrays, and params as `[hex]` or `"hex"`.
+fn params_first_string(params: &serde_json::Value) -> Option<String> {
+    match params {
+        serde_json::Value::Array(arr) => arr.first()?.as_str().map(|s| s.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn json_rpc_id(v: &serde_json::Value) -> serde_json::Value {
+    v.get("id").cloned().unwrap_or(serde_json::Value::Null)
+}
+
+fn extract_broadcast_from_value(v: &serde_json::Value) -> Option<(serde_json::Value, String)> {
     if v.get("method")?.as_str()? != "blockchain.transaction.broadcast" {
         return None;
     }
-    let id = v.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let hex = v
-        .get("params")?
-        .as_array()?
-        .first()?
-        .as_str()?
-        .to_string();
+    let id = json_rpc_id(v);
+    let hex = params_first_string(v.get("params")?)?;
     Some((id, hex))
+}
+
+fn extract_broadcast_hex(line: &str) -> Option<(serde_json::Value, String)> {
+    let v = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+    if let Some(arr) = v.as_array() {
+        for item in arr {
+            if let Some(found) = extract_broadcast_from_value(item) {
+                return Some(found);
+            }
+        }
+        return None;
+    }
+    extract_broadcast_from_value(&v)
 }
 
 fn line_looks_like_broadcast(line: &str) -> bool {
     line.contains("blockchain.transaction.broadcast")
+}
+
+fn line_json_rpc_id(line: &str) -> serde_json::Value {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+        return serde_json::Value::Null;
+    };
+    if let Some(arr) = v.as_array() {
+        for item in arr {
+            if item.get("method").and_then(|m| m.as_str()) == Some("blockchain.transaction.broadcast")
+            {
+                return json_rpc_id(item);
+            }
+        }
+    }
+    json_rpc_id(&v)
 }
 
 #[derive(Debug, Serialize)]
@@ -424,21 +459,39 @@ fn process_indexer_line(
 
 async fn notify_subscriptions(
     client_stream: &mut tokio::net::TcpStream,
-    _subscribed: &HashSet<String>,
+    subscribed: &HashSet<String>,
     scripthashes: &[String],
     pool_manager: Arc<PoolManager>,
     indexer_url: String,
 ) -> Result<()> {
     for sh in scripthashes {
+        if !subscribed.contains(sh) {
+            continue;
+        }
         let sh_clone = sh.clone();
         let pm = pool_manager.clone();
         let url = indexer_url.clone();
-        let new_hash = tokio::task::spawn_blocking(move || {
-            let real_history = fetch_scripthash_history_sync(&sh_clone, &url);
-            let pending = pm.get_pending_txids_for_scripthash(&sh_clone);
-            pending::compute_modified_status_hash(real_history, &sh_clone, &pending)
-        })
-        .await?;
+        let new_hash = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                let real_history = fetch_scripthash_history_sync(&sh_clone, &url);
+                let pending = pm.get_pending_txids_for_scripthash(&sh_clone);
+                pending::compute_modified_status_hash(real_history, &sh_clone, &pending)
+            }),
+        )
+        .await;
+
+        let new_hash = match new_hash {
+            Ok(Ok(h)) => h,
+            Ok(Err(e)) => {
+                tracing::warn!("Subscription notify task failed for {}: {}", &sh[..sh.len().min(16)], e);
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!("Subscription notify timed out for {}", &sh[..sh.len().min(16)]);
+                continue;
+            }
+        };
 
         if let Some(hash) = new_hash {
             tracing::info!(
@@ -454,6 +507,84 @@ async fn notify_subscriptions(
                 .write_all(&serde_json::to_vec(&notification)?)
                 .await?;
             client_stream.write_all(b"\n").await?;
+        }
+    }
+    Ok(())
+}
+
+async fn intercept_and_handle_broadcast(
+    client_stream: &mut tokio::net::TcpStream,
+    id: serde_json::Value,
+    hex_param: String,
+    pool_manager: &Arc<PoolManager>,
+    config: &Arc<Mutex<Config>>,
+    indexer_url: &str,
+    source_label: &str,
+    session: &SessionState,
+) -> Result<()> {
+    tracing::info!(
+        "INTERCEPTED blockchain.transaction.broadcast (hex len={})",
+        hex_param.len()
+    );
+    let pm = pool_manager.clone();
+    let cfg = config.clone();
+    let url = indexer_url.to_string();
+    let src = source_label.to_string();
+    let hex_owned = hex_param;
+
+    let broadcast_result = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(Ok(r))) => Ok(r),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(e)) => Err(anyhow::anyhow!("Task join error: {}", e)),
+        Err(_) => Err(anyhow::anyhow!("Broadcast handling timed out after 30s")),
+    };
+
+    match broadcast_result {
+        Ok(result) => {
+            tracing::info!("Broadcast retained, txid: {}", result.txid);
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": result.txid,
+                "id": id
+            });
+            client_stream
+                .write_all(&serde_json::to_vec(&response)?)
+                .await?;
+            client_stream.write_all(b"\n").await?;
+            client_stream.flush().await?;
+            if result.retained {
+                if let Err(e) = notify_subscriptions(
+                    client_stream,
+                    &session.subscribed_scripthashes,
+                    &result.affected_scripthashes,
+                    pool_manager.clone(),
+                    indexer_url.to_string(),
+                )
+                .await
+                {
+                    tracing::warn!("Post-broadcast subscription notify failed: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("Broadcast intercept failed: {}", e);
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "error": { "code": -25, "message": e.to_string() },
+                "id": id
+            });
+            client_stream
+                .write_all(&serde_json::to_vec(&response)?)
+                .await?;
+            client_stream.write_all(b"\n").await?;
+            client_stream.flush().await?;
         }
     }
     Ok(())
@@ -620,71 +751,35 @@ async fn handle_connection(
                             // Always intercept broadcast locally — never forward to upstream electrs
                             // (real electrs rejects non-final txs and Sparrow would hang/error).
                             if let Some((id, hex_param)) = extract_broadcast_hex(&line_str) {
-                                tracing::info!(
-                                    "INTERCEPTED blockchain.transaction.broadcast (hex len={})",
-                                    hex_param.len()
-                                );
-                                let hex_owned = hex_param;
-                                let pm = pool_manager.clone();
-                                let cfg = config.clone();
-                                let url = indexer_url.clone();
-                                let src = source_label.to_string();
-                                let broadcast_result = tokio::time::timeout(
-                                    std::time::Duration::from_secs(20),
-                                    tokio::task::spawn_blocking(move || {
-                                        handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
-                                    }),
+                                intercept_and_handle_broadcast(
+                                    &mut client_stream,
+                                    id,
+                                    hex_param,
+                                    &pool_manager,
+                                    &config,
+                                    &indexer_url,
+                                    source_label,
+                                    &session,
                                 )
-                                .await
-                                .map_err(|_| anyhow::anyhow!("Broadcast handling timed out"))?
-                                .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?;
-
-                                match broadcast_result {
-                                    Ok(result) => {
-                                        tracing::info!("Broadcast retained, txid: {}", result.txid);
-                                        let response = serde_json::json!({
-                                            "jsonrpc": "2.0",
-                                            "result": result.txid,
-                                            "id": id
-                                        });
-                                        client_stream.write_all(&serde_json::to_vec(&response)?).await?;
-                                        client_stream.write_all(b"\n").await?;
-                                        if result.retained {
-                                            notify_subscriptions(
-                                                &mut client_stream,
-                                                &session.subscribed_scripthashes,
-                                                &result.affected_scripthashes,
-                                                pool_manager.clone(),
-                                                indexer_url.clone(),
-                                            ).await?;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::error!("Broadcast intercept failed: {}", e);
-                                        let response = serde_json::json!({
-                                            "jsonrpc": "2.0",
-                                            "error": { "code": -25, "message": e.to_string() },
-                                            "id": id
-                                        });
-                                        client_stream.write_all(&serde_json::to_vec(&response)?).await?;
-                                        client_stream.write_all(b"\n").await?;
-                                    }
-                                }
+                                .await?;
                                 continue;
                             }
 
                             if line_looks_like_broadcast(&line_str) {
+                                let id = line_json_rpc_id(&line_str);
                                 tracing::error!(
-                                    "Unparsed broadcast request (not forwarding to indexer): {}",
+                                    "Unparsed broadcast request (not forwarding to indexer, id={}): {}",
+                                    id,
                                     &line_str[..line_str.len().min(240)]
                                 );
                                 let response = serde_json::json!({
                                     "jsonrpc": "2.0",
                                     "error": { "code": -32602, "message": "Invalid broadcast params" },
-                                    "id": null
+                                    "id": id
                                 });
                                 client_stream.write_all(&serde_json::to_vec(&response)?).await?;
                                 client_stream.write_all(b"\n").await?;
+                                client_stream.flush().await?;
                                 continue;
                             }
 
@@ -712,6 +807,35 @@ async fn handle_connection(
                                     }
                                 }
 
+                                // Fallback intercept (extract_broadcast_hex should have caught this)
+                                if request.method == "blockchain.transaction.broadcast" {
+                                    if let Some(ref params) = request.params {
+                                        if let Some(hex_param) = params_first_string(params) {
+                                            intercept_and_handle_broadcast(
+                                                &mut client_stream,
+                                                request.id.clone(),
+                                                hex_param,
+                                                &pool_manager,
+                                                &config,
+                                                &indexer_url,
+                                                source_label,
+                                                &session,
+                                            )
+                                            .await?;
+                                            continue;
+                                        }
+                                    }
+                                    let response = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "error": { "code": -32602, "message": "Invalid params" },
+                                        "id": request.id
+                                    });
+                                    client_stream.write_all(&serde_json::to_vec(&response)?).await?;
+                                    client_stream.write_all(b"\n").await?;
+                                    client_stream.flush().await?;
+                                    continue;
+                                }
+
                                 // Track requests that need response modification
                                 session.track_request(&request);
 
@@ -731,6 +855,10 @@ async fn handle_connection(
                                     client_stream.write_all(&serde_json::to_vec(&response)?).await?;
                                     client_stream.write_all(b"\n").await?;
                                 }
+                            } else if line_looks_like_broadcast(&line_str) {
+                                tracing::error!(
+                                    "Broadcast-shaped line reached forward path — refusing to proxy to indexer"
+                                );
                             } else if let Some(ref mut idx) = indexer_stream {
                                 idx.write_all(&line_bytes).await?;
                                 idx.write_all(b"\n").await?;
@@ -1250,7 +1378,11 @@ fn handle_broadcast(
     };
 
     let current_block_height = pool_manager.check_block_height().ok().flatten();
-    let current_mtp = pool_manager.get_median_time_past_cached().ok();
+    let current_mtp = if nlocktime > 500_000_000 {
+        pool_manager.get_median_time_past_cached().ok()
+    } else {
+        None
+    };
     let (broadcast_mode, scheduled_time) = {
         let cfg = config.lock().map_err(|e| anyhow::anyhow!("Config lock: {}", e))?;
         resolve_ingest_plan(
