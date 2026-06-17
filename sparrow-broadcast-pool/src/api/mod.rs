@@ -409,8 +409,33 @@ struct ConfigResponse {
 }
 
 async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse>, (StatusCode, String)> {
-    let config = state.config.lock().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    Ok(Json(config_to_response(&config, false)))
+    let mut config = state
+        .config
+        .lock()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut reconnect = false;
+    if crate::discovery::is_umbrel_mode() {
+        let had_mistaken = config.indexer.as_ref().and_then(|i| {
+            crate::discovery::extract_indexer_host(&i.url)
+                .filter(|h| crate::discovery::is_mistaken_umbrel_lan_override(h))
+        });
+        if had_mistaken.is_some() {
+            config.indexer = None;
+            if crate::discovery::apply_indexer_discovery(&mut config) {
+                reconnect = true;
+            }
+            let _ = crate::discovery::save_config_to_disk(&config);
+        }
+    }
+    let response = config_to_response(&config, false);
+    drop(config);
+    if reconnect {
+        let pool_manager = state.pool_manager.clone();
+        if let Err(e) = pool_manager.reconnect_indexer_from_config() {
+            tracing::warn!("Could not reconnect indexer after auto-heal: {}", e);
+        }
+    }
+    Ok(Json(response))
 }
 
 #[derive(Deserialize)]
@@ -463,10 +488,10 @@ async fn save_config(
         if url.trim().is_empty() {
             if crate::discovery::is_umbrel_mode() {
                 tracing::info!("Clearing manual indexer override — reconnecting to node indexer");
-                if let Some(ref mut idx) = config.indexer {
-                    idx.manual_override = false;
-                }
-                crate::discovery::apply_indexer_discovery(&mut config)
+                config.indexer = None;
+                let found = crate::discovery::apply_indexer_discovery(&mut config);
+                let _ = crate::discovery::save_config_to_disk(&config);
+                found
             } else {
                 false
             }

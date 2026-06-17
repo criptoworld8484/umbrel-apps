@@ -306,6 +306,9 @@ pub fn is_mistaken_umbrel_lan_override(host: &str) -> bool {
     if host.is_empty() {
         return false;
     }
+    if host == "electrs" || host == "localhost" || host == "127.0.0.1" {
+        return false;
+    }
     let node_ip = std::env::var("APP_ELECTRS_NODE_IP")
         .unwrap_or_default()
         .trim()
@@ -313,28 +316,44 @@ pub fn is_mistaken_umbrel_lan_override(host: &str) -> bool {
     if !node_ip.is_empty() && host == node_ip {
         return false;
     }
+    // Umbrel inter-app network (10.21.x.x) — valid electrs target.
+    if host.starts_with("10.21.") {
+        return false;
+    }
     if let Ok(lan) = std::env::var("BROADCAST_POOL_LAN_IP") {
         if host == lan.trim() {
             return true;
         }
     }
-    detect_lan_ip().as_deref() == Some(host)
+    // Wallet/home LAN IPs are not reachable as electrs from the app container.
+    is_private_lan_host(host)
 }
 
-fn clear_mistaken_umbrel_lan_override(config: &mut Config) {
-    let mistaken = config.indexer.as_ref().and_then(|idx| {
-        if !idx.manual_override {
-            return None;
+fn is_private_lan_host(host: &str) -> bool {
+    if host.starts_with("192.168.") {
+        return true;
+    }
+    if let Some(rest) = host.strip_prefix("172.") {
+        if let Some(oct) = rest.split('.').next().and_then(|s| s.parse::<u8>().ok()) {
+            return (16..=31).contains(&oct);
         }
+    }
+    false
+}
+
+fn clear_mistaken_umbrel_lan_override(config: &mut Config) -> bool {
+    let mistaken = config.indexer.as_ref().and_then(|idx| {
         extract_indexer_host(&idx.url).filter(|h| is_mistaken_umbrel_lan_override(h))
     });
     if let Some(host) = mistaken {
         tracing::info!(
-            "Removing mistaken Umbrel indexer override at {} (wallet LAN — use APP_ELECTRS_NODE_IP instead)",
+            "Removing Umbrel indexer URL at {} (wallet/home LAN — electrs uses APP_ELECTRS_NODE_IP)",
             host
         );
         config.indexer = None;
+        return true;
     }
+    false
 }
 
 fn indexer_ports_to_try() -> Vec<u16> {
@@ -393,9 +412,31 @@ fn lan_subnet_hosts(lan_ip: &str) -> Vec<String> {
 
 fn try_host(network: &NetworkType, host: &str, ports: &[u16]) -> Option<String> {
     for url in candidate_urls_for_host(host, ports) {
-        if indexer_matches_network(&url, network) {
+        if !tcp_reachable_from_url(&url) {
+            tracing::debug!("Indexer probe skip (port closed): {}", display_indexer_url(&url));
+            continue;
+        }
+        if crate::rpc::indexer_transport::probe_working_url(&[url.clone()]).is_none() {
+            tracing::debug!("Indexer probe skip (no RPC): {}", display_indexer_url(&url));
+            continue;
+        }
+        let client = match ElectrumClient::new(&url) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if client.genesis_matches_network(network).unwrap_or(false) {
+            tracing::info!(
+                "Indexer OK at {} (genesis matches {})",
+                display_indexer_url(&url),
+                network.data_dir_name()
+            );
             return Some(url);
         }
+        tracing::debug!(
+            "Indexer at {} reachable but genesis mismatch for {}",
+            display_indexer_url(&url),
+            network.data_dir_name()
+        );
     }
     None
 }
@@ -612,7 +653,7 @@ pub fn apply_indexer_discovery(config: &mut Config) -> bool {
     let network = config.network.network_type.clone();
 
     if is_umbrel_mode() {
-        clear_mistaken_umbrel_lan_override(config);
+        let cleared = clear_mistaken_umbrel_lan_override(config);
         if !config
             .indexer
             .as_ref()
@@ -626,8 +667,13 @@ pub fn apply_indexer_discovery(config: &mut Config) -> bool {
                 return true;
             }
             tracing::warn!(
-                "Could not reach Umbrel electrs (APP_ELECTRS_NODE_IP) — check Electrs is running"
+                "Could not reach Umbrel electrs — APP_ELECTRS_NODE_IP={:?}, APP_ELECTRS_NODE_PORT={:?}",
+                std::env::var("APP_ELECTRS_NODE_IP").ok(),
+                std::env::var("APP_ELECTRS_NODE_PORT").ok(),
             );
+        }
+        if cleared {
+            return false;
         }
     }
 
@@ -716,11 +762,7 @@ pub fn apply_lan_ip(config: &mut Config) {
 }
 
 pub fn save_config_to_disk(config: &Config) -> anyhow::Result<()> {
-    let config_path = dirs::config_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("broadcast-pool")
-        .join("config.toml");
+    let config_path = Config::resolved_config_path();
 
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -780,6 +822,8 @@ mod tests {
         std::env::set_var("APP_ELECTRS_NODE_IP", "10.21.21.9");
         assert!(is_mistaken_umbrel_lan_override("192.168.50.26"));
         assert!(!is_mistaken_umbrel_lan_override("10.21.21.9"));
+        assert!(!is_mistaken_umbrel_lan_override("10.21.22.5"));
+        assert!(!is_mistaken_umbrel_lan_override("electrs"));
         std::env::remove_var("BROADCAST_POOL_UMBREL");
         std::env::remove_var("BROADCAST_POOL_LAN_IP");
         std::env::remove_var("APP_ELECTRS_NODE_IP");

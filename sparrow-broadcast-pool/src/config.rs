@@ -57,7 +57,7 @@ impl std::str::FromStr for BroadcastMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IndexerConfig {
     pub url: String,
     /// User-provided external indexer; when true, startup skips auto-discovery.
@@ -156,10 +156,22 @@ impl Config {
     }
 
     fn default_config_path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir()
+        Ok(Self::resolved_config_path())
+    }
+
+    /// Prefer `BROADCAST_POOL_DATA_DIR/config.toml` on Umbrel so settings survive in the app volume.
+    pub fn resolved_config_path() -> PathBuf {
+        if let Ok(dir) = std::env::var("BROADCAST_POOL_DATA_DIR") {
+            let dir = dir.trim();
+            if !dir.is_empty() {
+                return PathBuf::from(dir).join("config.toml");
+            }
+        }
+        dirs::config_dir()
             .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
-            .unwrap_or_else(|| PathBuf::from("."));
-        Ok(config_dir.join("broadcast-pool").join("config.toml"))
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("broadcast-pool")
+            .join("config.toml")
     }
 
     pub fn default_config() -> Self {
