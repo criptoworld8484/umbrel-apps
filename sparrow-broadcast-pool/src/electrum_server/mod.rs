@@ -66,9 +66,13 @@ impl AsyncWrite for IndexerStream {
 async fn connect_indexer(indexer_url: &str) -> Result<IndexerStream> {
     let use_ssl = indexer_url.starts_with("ssl://");
     let addr = pending::strip_indexer_host(indexer_url);
-    let tcp = tokio::net::TcpStream::connect(&addr)
-        .await
-        .with_context(|| format!("TCP connect to indexer failed ({})", addr))?;
+    let tcp = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("TCP connect to indexer timed out ({})", addr))?
+    .with_context(|| format!("TCP connect to indexer failed ({})", addr))?;
 
     if use_ssl {
         let mut root_store = rustls::RootCertStore::empty();
@@ -457,6 +461,62 @@ fn process_indexer_line(
     Ok(out)
 }
 
+/// Answer Electrum handshake locally so Sparrow connects even when upstream electrs is down.
+fn local_electrum_response(
+    request: &JsonRpcRequest,
+    config: &Mutex<Config>,
+) -> Option<serde_json::Value> {
+    let id = request.id.clone();
+    match request.method.as_str() {
+        "server.version" => Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": ["broadcast-pool Electrum", "1.4"],
+            "id": id
+        })),
+        "server.banner" => Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": "broadcast-pool — Bitcoin transaction pool for Sparrow",
+            "id": id
+        })),
+        "server.ping" => Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": true,
+            "id": id
+        })),
+        "server.features" => {
+            let genesis = config
+                .lock()
+                .ok()
+                .map(|c| c.network.network_type.genesis_hash().to_string())
+                .unwrap_or_else(|| "0".repeat(64));
+            Some(serde_json::json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "genesis_hash": genesis,
+                    "protocol_max": "1.4",
+                    "protocol_min": "1.0",
+                    "protocol_version": "1.4",
+                    "hash_function": "sha256"
+                },
+                "id": id
+            }))
+        }
+        _ => None,
+    }
+}
+
+async fn write_json_rpc_response(
+    client_stream: &mut tokio::net::TcpStream,
+    response: &serde_json::Value,
+) -> Result<()> {
+    client_stream
+        .write_all(&serde_json::to_vec(response)?)
+        .await?;
+    client_stream.write_all(b"\n").await?;
+    client_stream.flush().await?;
+    Ok(())
+}
+
 async fn notify_subscriptions(
     client_stream: &mut tokio::net::TcpStream,
     subscribed: &HashSet<String>,
@@ -670,6 +730,11 @@ async fn run_electrum_listener(
     loop {
         match listener.accept().await {
             Ok((client_stream, peer_addr)) => {
+                tracing::info!(
+                    "Electrum client connected from {} [{}]",
+                    peer_addr,
+                    source_label
+                );
                 let pool_manager = pool_manager.clone();
                 let config = config.clone();
                 tokio::spawn(async move {
@@ -702,28 +767,33 @@ async fn handle_connection(
 ) -> Result<()> {
     let indexer_url = {
         let cfg = config.lock().map_err(|e| anyhow::anyhow!("Config lock: {}", e))?;
-        match &cfg.indexer {
-            Some(idx) => idx.url.clone(),
-            None => anyhow::bail!("No indexer configured"),
-        }
+        cfg.indexer.as_ref().map(|idx| idx.url.clone())
     };
 
-    let mut indexer_stream = match connect_indexer(&indexer_url).await {
-        Ok(s) => Some(s),
-        Err(e) => {
-            tracing::warn!(
-                "Indexer connect failed ({}): {} — serving broadcast intercept only until indexer is up",
-                indexer_url,
-                e
-            );
-            None
+    let mut indexer_stream = if let Some(ref url) = indexer_url {
+        match connect_indexer(url).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(
+                    "Indexer connect failed ({}): {} — wallet proxy continues (handshake + broadcast pool)",
+                    url,
+                    e
+                );
+                None
+            }
         }
+    } else {
+        tracing::warn!(
+            "No indexer configured — wallet proxy serves Electrum handshake and broadcast pool only"
+        );
+        None
     };
+    let indexer_url = indexer_url.unwrap_or_default();
     if indexer_stream.is_some() {
         tracing::debug!("Proxy connection: {} <-> indexer {}", peer_addr, indexer_url);
     } else {
-        tracing::warn!(
-            "Electrum proxy for {} running without upstream indexer (broadcast pool still accepts txs)",
+        tracing::info!(
+            "Electrum session for {} without upstream indexer (local handshake + pool)",
             peer_addr
         );
     }
@@ -785,6 +855,12 @@ async fn handle_connection(
 
                             if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&line_str) {
 
+                                // Handshake locally — Sparrow must get these before anything else.
+                                if let Some(response) = local_electrum_response(&request, &config) {
+                                    write_json_rpc_response(&mut client_stream, &response).await?;
+                                    continue;
+                                }
+
                                 // === Intercept blockchain.transaction.get for pending txs ===
                                 if request.method == "blockchain.transaction.get" {
                                     if let Some(params) = request.params.as_ref().and_then(|p| p.as_array()) {
@@ -844,6 +920,11 @@ async fn handle_connection(
                                     idx.write_all(&line_bytes).await?;
                                     idx.write_all(b"\n").await?;
                                 } else {
+                                    tracing::debug!(
+                                        "No indexer for {} — returning unavailable for id {:?}",
+                                        request.method,
+                                        request.id
+                                    );
                                     let response = serde_json::json!({
                                         "jsonrpc": "2.0",
                                         "error": {
@@ -852,8 +933,7 @@ async fn handle_connection(
                                         },
                                         "id": request.id
                                     });
-                                    client_stream.write_all(&serde_json::to_vec(&response)?).await?;
-                                    client_stream.write_all(b"\n").await?;
+                                    write_json_rpc_response(&mut client_stream, &response).await?;
                                 }
                             } else if line_looks_like_broadcast(&line_str) {
                                 tracing::error!(

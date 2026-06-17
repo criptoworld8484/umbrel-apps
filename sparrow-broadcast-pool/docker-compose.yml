@@ -15,7 +15,7 @@ services:
     command: ["sh", "-c", "mkdir -p /data && chown -R 1000:1000 /data && chmod 755 /data"]
 
   web:
-    image: ghcr.io/criptoworld8484/broadcast-pool-umbrel:0.2.9
+    image: ghcr.io/criptoworld8484/broadcast-pool-umbrel:0.2.10
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
@@ -23,7 +23,7 @@ services:
       init:
         condition: service_completed_successfully
     ports:
-      - "50050:50050"
+      - "0.0.0.0:50050:50050/tcp"
     volumes:
       - ${APP_DATA_DIR}/data:/home/app/data
     environment:
