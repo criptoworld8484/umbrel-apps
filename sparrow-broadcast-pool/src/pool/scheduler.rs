@@ -88,7 +88,10 @@ impl Scheduler {
                                 continue;
                             }
                             if let Some(nlocktime) = tx.nlocktime {
-                                if nlocktime > 0 && current_height >= nlocktime {
+                                if nlocktime > 0
+                                    && nlocktime < 500_000_000
+                                    && current_height >= nlocktime
+                                {
                                     tracing::info!(
                                         "Transaction {} now due (block height {} reached)",
                                         tx.id,

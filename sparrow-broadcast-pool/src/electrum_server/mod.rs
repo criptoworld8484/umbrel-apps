@@ -517,6 +517,17 @@ async fn write_json_rpc_response(
     Ok(())
 }
 
+struct BroadcastPreview {
+    txid: String,
+}
+
+fn quick_broadcast_preview(tx_hex: &str) -> Result<BroadcastPreview> {
+    let tx_hex_clean = tx_hex.trim();
+    hex::decode(tx_hex_clean).context("Invalid transaction hex")?;
+    let txid = pending::compute_txid(tx_hex_clean)?;
+    Ok(BroadcastPreview { txid })
+}
+
 async fn notify_subscriptions(
     client_stream: &mut tokio::net::TcpStream,
     subscribed: &HashSet<String>,
@@ -586,39 +597,81 @@ async fn intercept_and_handle_broadcast(
         "INTERCEPTED blockchain.transaction.broadcast (hex len={})",
         hex_param.len()
     );
+
+    let hex_quick = hex_param.clone();
+    let preview = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || quick_broadcast_preview(&hex_quick)),
+    )
+    .await
+    {
+        Ok(Ok(Ok(p))) => p,
+        Ok(Ok(Err(e))) => {
+            tracing::error!("Broadcast preview failed: {}", e);
+            write_json_rpc_response(
+                client_stream,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -25, "message": e.to_string() },
+                    "id": id
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        Ok(Err(e)) => {
+            tracing::error!("Broadcast preview task failed: {}", e);
+            write_json_rpc_response(
+                client_stream,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -25, "message": e.to_string() },
+                    "id": id
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(_) => {
+            tracing::error!("Broadcast preview timed out");
+            write_json_rpc_response(
+                client_stream,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -25, "message": "Invalid transaction hex" },
+                    "id": id
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    write_json_rpc_response(
+        client_stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": preview.txid,
+            "id": id
+        }),
+    )
+    .await?;
+    tracing::info!("Broadcast ack sent to wallet, txid={}", preview.txid);
+
     let pm = pool_manager.clone();
     let cfg = config.clone();
     let url = indexer_url.to_string();
     let src = source_label.to_string();
     let hex_owned = hex_param;
 
-    let broadcast_result = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        tokio::task::spawn_blocking(move || {
-            handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
-        }),
-    )
-    .await
-    {
-        Ok(Ok(Ok(r))) => Ok(r),
-        Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(e)) => Err(anyhow::anyhow!("Task join error: {}", e)),
-        Err(_) => Err(anyhow::anyhow!("Broadcast handling timed out after 30s")),
-    };
+    let ingest = tokio::task::spawn_blocking(move || {
+        handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
+    })
+    .await;
 
-    match broadcast_result {
-        Ok(result) => {
-            tracing::info!("Broadcast retained, txid: {}", result.txid);
-            let response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": result.txid,
-                "id": id
-            });
-            client_stream
-                .write_all(&serde_json::to_vec(&response)?)
-                .await?;
-            client_stream.write_all(b"\n").await?;
-            client_stream.flush().await?;
+    match ingest {
+        Ok(Ok(result)) => {
+            tracing::info!("Broadcast ingested into pool, txid={}", result.txid);
             if result.retained {
                 if let Err(e) = notify_subscriptions(
                     client_stream,
@@ -633,19 +686,16 @@ async fn intercept_and_handle_broadcast(
                 }
             }
         }
-        Err(e) => {
-            tracing::error!("Broadcast intercept failed: {}", e);
-            let response = serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": { "code": -25, "message": e.to_string() },
-                "id": id
-            });
-            client_stream
-                .write_all(&serde_json::to_vec(&response)?)
-                .await?;
-            client_stream.write_all(b"\n").await?;
-            client_stream.flush().await?;
-        }
+        Ok(Err(e)) => tracing::error!(
+            "Broadcast ack sent but pool ingest failed for {}: {}",
+            preview.txid,
+            e
+        ),
+        Err(e) => tracing::error!(
+            "Broadcast ack sent but pool ingest task failed for {}: {}",
+            preview.txid,
+            e
+        ),
     }
     Ok(())
 }
@@ -1328,8 +1378,6 @@ fn resolve_ingest_plan(
     source_label: &str,
     nlocktime: u32,
     config: &Config,
-    current_block_height: Option<u64>,
-    current_mtp: Option<u64>,
 ) -> (BroadcastMode, Option<chrono::DateTime<chrono::Utc>>) {
     if source_label == "liana" {
         tracing::info!("Liana ingest → manual scheduling (pending until user sets date/price)");
@@ -1339,43 +1387,21 @@ fn resolve_ingest_plan(
         tracing::info!("Sparrow ingest with nLockTime disabled → manual scheduling");
         return (BroadcastMode::Manual, None);
     }
-    // Block-height nLockTime
-    if nlocktime > 0 && nlocktime < 500_000_000 {
-        if let Some(height) = current_block_height {
-            if height >= nlocktime as u64 {
-                tracing::info!(
-                    "Ingest with block-height nLockTime {} already satisfied (chain at {}) → manual scheduling",
-                    nlocktime,
-                    height
-                );
-                return (BroadcastMode::Manual, None);
-            }
-        }
+    // Timestamp nLockTime (Sparrow MTP-by-date or block MTP converted to unix time).
+    if nlocktime > 500_000_000 {
         tracing::info!(
-            "Future block-height nLockTime {} → by_block mode (ignoring dashboard broadcast mode)",
+            "Timestamp nLockTime {} → scheduled (MTP enforced when broadcasting)",
+            nlocktime
+        );
+        return (BroadcastMode::Scheduled, None);
+    }
+    // Block-height nLockTime — no indexer RPC at ingest; scheduler waits for chain height.
+    if nlocktime > 0 && nlocktime < 500_000_000 {
+        tracing::info!(
+            "Block-height nLockTime {} → by_block mode",
             nlocktime
         );
         return (BroadcastMode::ByBlock, None);
-    }
-    // Timestamp / MTP nLockTime — never immediate-broadcast at ingest
-    if nlocktime > 500_000_000 {
-        if let Some(mtp) = current_mtp {
-            if (nlocktime as u64) > mtp {
-                tracing::info!(
-                    "Future timestamp nLockTime {} → scheduled (chain MTP {})",
-                    nlocktime,
-                    mtp
-                );
-                return (BroadcastMode::Scheduled, None);
-            }
-        } else {
-            tracing::info!(
-                "Future timestamp nLockTime {} → scheduled (MTP unknown)",
-                nlocktime
-            );
-            return (BroadcastMode::Scheduled, None);
-        }
-        return (BroadcastMode::Manual, None);
     }
     resolve_broadcast_plan(nlocktime, config)
 }
@@ -1457,21 +1483,9 @@ fn handle_broadcast(
         cfg.network.network_type.data_dir_name().to_string()
     };
 
-    let current_block_height = pool_manager.check_block_height().ok().flatten();
-    let current_mtp = if nlocktime > 500_000_000 {
-        pool_manager.get_median_time_past_cached().ok()
-    } else {
-        None
-    };
     let (broadcast_mode, scheduled_time) = {
         let cfg = config.lock().map_err(|e| anyhow::anyhow!("Config lock: {}", e))?;
-        resolve_ingest_plan(
-            source_label,
-            nlocktime,
-            &cfg,
-            current_block_height,
-            current_mtp,
-        )
+        resolve_ingest_plan(source_label, nlocktime, &cfg)
     };
 
     tracing::info!(
