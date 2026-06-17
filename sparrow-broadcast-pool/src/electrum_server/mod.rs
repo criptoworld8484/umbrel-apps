@@ -1070,7 +1070,6 @@ fn resolve_ingest_plan(
         return (BroadcastMode::Manual, None);
     }
     // Block-height nLockTime already satisfied at ingest → manual (date/price scheduling).
-    // Future block-height or MTP locktimes keep by_block / scheduled behaviour.
     if nlocktime > 0 && nlocktime < 500_000_000 {
         if let Some(height) = current_block_height {
             if height >= nlocktime as u64 {
@@ -1082,6 +1081,11 @@ fn resolve_ingest_plan(
                 return (BroadcastMode::Manual, None);
             }
         }
+        tracing::info!(
+            "Future block-height nLockTime {} → by_block mode (ignoring dashboard broadcast mode)",
+            nlocktime
+        );
+        return (BroadcastMode::ByBlock, None);
     }
     resolve_broadcast_plan(nlocktime, config)
 }
@@ -1220,7 +1224,7 @@ fn handle_broadcast(
             indexer_url.to_string()
         };
         let indexer_addr = pending::strip_indexer_host(&url);
-        let scripthashes = pending::extract_affected_scripthashes(tx_hex, &indexer_addr)?;
+        let scripthashes = pending::extract_affected_scripthashes_opts(tx_hex, &indexer_addr, true)?;
         let outputs: Vec<PendingTxOutput> = pending::extract_outputs(tx_hex)?
             .into_iter()
             .map(|(output_index, value, scripthash)| PendingTxOutput {

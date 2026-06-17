@@ -2158,7 +2158,12 @@
         async function remove(id) {
             if (!confirm('Remove this transaction from pool?')) return;
             try {
-                await fetch(`/api/transactions/${id}/remove`, {method: 'POST'});
+                const res = await fetch(`/api/transactions/${id}/remove`, {method: 'POST'});
+                if (!res.ok) {
+                    const err = await res.text();
+                    toast(err || 'Error');
+                    return;
+                }
                 toast(t('toast_removed'));
                 refresh();
             } catch (e) { toast('Error'); }

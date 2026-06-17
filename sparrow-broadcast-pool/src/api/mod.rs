@@ -355,11 +355,19 @@ async fn remove_transaction(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    state
-        .pool_manager
-        .remove_transaction(&id)
+    let pool_manager = state.pool_manager.clone();
+    tokio::task::spawn_blocking(move || pool_manager.remove_transaction(&id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {}", e)))?
         .map(|_| StatusCode::OK)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("not found") {
+                (StatusCode::NOT_FOUND, msg)
+            } else {
+                (StatusCode::INTERNAL_SERVER_ERROR, msg)
+            }
+        })
 }
 
 async fn retry_transaction(

@@ -268,12 +268,34 @@ fn fetch_prev_tx(txid_str: &str, indexer_addr: &str) -> Result<Transaction> {
     Transaction::consensus_decode(&mut cursor).context("Failed to decode prev tx from indexer")
 }
 
+pub fn extract_output_scripthashes(tx_hex: &str) -> Result<Vec<String>> {
+    let tx = decode_tx(tx_hex)?;
+    Ok(tx
+        .output
+        .iter()
+        .map(|o| compute_scripthash(&o.script_pubkey))
+        .collect())
+}
+
 pub fn extract_affected_scripthashes(tx_hex: &str, indexer_addr: &str) -> Result<Vec<String>> {
+    extract_affected_scripthashes_opts(tx_hex, indexer_addr, false)
+}
+
+/// When `fast` is true, only output scripthashes (no blocking prev-tx fetches to the indexer).
+pub fn extract_affected_scripthashes_opts(
+    tx_hex: &str,
+    indexer_addr: &str,
+    fast: bool,
+) -> Result<Vec<String>> {
     let tx = decode_tx(tx_hex)?;
     let mut scripthashes = HashSet::new();
 
     for output in &tx.output {
         scripthashes.insert(compute_scripthash(&output.script_pubkey));
+    }
+
+    if fast {
+        return Ok(scripthashes.into_iter().collect());
     }
 
     for input in &tx.input {

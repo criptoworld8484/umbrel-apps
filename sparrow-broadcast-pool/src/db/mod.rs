@@ -455,11 +455,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn remove_broadcast_tx(&self, id: &str) -> Result<()> {
+    pub fn remove_broadcast_tx(&self, id: &str) -> Result<usize> {
         let conn = self.lock_conn()?;
-        conn.execute("DELETE FROM broadcast_pool WHERE id = ?1", params![id])
+        let n = conn
+            .execute("DELETE FROM broadcast_pool WHERE id = ?1", params![id])
             .context("Failed to remove broadcast tx")?;
-        Ok(())
+        Ok(n)
     }
 
     pub fn get_pool_stats(&self, network: &str) -> Result<PoolStats> {

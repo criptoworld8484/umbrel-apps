@@ -784,7 +784,18 @@ impl PoolManager {
     }
 
     pub fn remove_transaction(&self, id: &str) -> Result<()> {
-        self.db.remove_broadcast_tx(id)?;
+        let tx = self.db.get_broadcast_tx_by_id(id)?;
+        let txid = tx
+            .txid
+            .clone()
+            .or_else(|| crate::pool::virtual_mempool::compute_txid(&tx.tx_hex).ok());
+        let removed = self.db.remove_broadcast_tx(id)?;
+        if removed == 0 {
+            anyhow::bail!("Transaction not found");
+        }
+        if let Some(txid) = txid {
+            self.remove_pending_tx(&txid);
+        }
         tracing::info!("Removed transaction {} from broadcast pool", id);
         Ok(())
     }
