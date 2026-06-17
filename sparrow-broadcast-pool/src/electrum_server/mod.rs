@@ -286,6 +286,9 @@ struct BroadcastHandleResult {
 struct SessionState {
     subscribed_scripthashes: HashSet<String>,
     pending_methods: HashMap<serde_json::Value, (String, String)>,
+    /// While handling a client JSON-RPC line, defer upstream notifications to avoid interleaving.
+    client_busy: bool,
+    deferred_indexer_out: Vec<Vec<u8>>,
 }
 
 impl SessionState {
@@ -293,6 +296,8 @@ impl SessionState {
         Self {
             subscribed_scripthashes: HashSet::new(),
             pending_methods: HashMap::new(),
+            client_busy: false,
+            deferred_indexer_out: Vec::new(),
         }
     }
 
@@ -475,7 +480,7 @@ fn local_electrum_response(
         })),
         "server.banner" => Some(serde_json::json!({
             "jsonrpc": "2.0",
-            "result": "broadcast-pool — Bitcoin transaction pool for Sparrow",
+            "result": format!("broadcast-pool {} — Bitcoin transaction pool for Sparrow", env!("CARGO_PKG_VERSION")),
             "id": id
         })),
         "server.ping" => Some(serde_json::json!({
@@ -958,6 +963,132 @@ async fn run_electrum_listener(
     }
 }
 
+async fn flush_deferred_indexer_out(
+    session: &mut SessionState,
+    client_stream: &mut tokio::net::TcpStream,
+) -> Result<()> {
+    session.client_busy = false;
+    for out in session.deferred_indexer_out.drain(..) {
+        client_stream.write_all(&out).await?;
+    }
+    client_stream.flush().await?;
+    Ok(())
+}
+
+async fn process_client_line(
+    line_bytes: &[u8],
+    line_str: &str,
+    peer_addr: std::net::SocketAddr,
+    pool_manager: &Arc<PoolManager>,
+    config: &Arc<Mutex<Config>>,
+    indexer_url: &str,
+    indexer_stream: &mut Option<IndexerStream>,
+    session: &mut SessionState,
+    source_label: &str,
+    client_stream: &mut tokio::net::TcpStream,
+) -> Result<()> {
+    if line_str.trim().is_empty() {
+        return Ok(());
+    }
+
+    if let Some((id, hex_param)) = extract_broadcast_hex(line_str) {
+        if let Err(e) = intercept_and_handle_broadcast(
+            client_stream,
+            id,
+            hex_param,
+            pool_manager,
+            config,
+            indexer_url,
+            source_label,
+            session,
+        )
+        .await
+        {
+            tracing::error!("Broadcast handler error ({}): {}", source_label, e);
+        }
+        return Ok(());
+    }
+
+    if line_looks_like_broadcast(line_str) {
+        let id = line_json_rpc_id(line_str);
+        tracing::error!(
+            "Unparsed broadcast request (not forwarding to indexer, id={}): {}",
+            id,
+            &line_str[..line_str.len().min(240)]
+        );
+        write_json_rpc_response(
+            client_stream,
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "error": { "code": -32602, "message": "Invalid broadcast params" },
+                "id": id
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let batch = line_is_batch(line_str);
+    let subrequests = match parse_subrequests(line_str) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Invalid client JSON from {}: {}", peer_addr, e);
+            return Ok(());
+        }
+    };
+    tracing::info!(
+        "Electrum RPC from {}: [{}]",
+        peer_addr,
+        subrequests
+            .iter()
+            .map(|r| r.method.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    session.client_busy = true;
+
+    // Handshake + mixed batches: answer locally / sync-forward per subrequest (never proxy whole batch).
+    if batch_contains_local_handshake(&subrequests) || indexer_stream.is_none() {
+        let mut responses = Vec::with_capacity(subrequests.len());
+        for req in &subrequests {
+            responses.push(
+                handle_one_subrequest(
+                    req,
+                    pool_manager,
+                    config,
+                    indexer_url,
+                    indexer_stream,
+                    session,
+                    source_label,
+                    client_stream,
+                )
+                .await?,
+            );
+        }
+        write_client_responses(client_stream, &responses, batch).await?;
+        flush_deferred_indexer_out(session, client_stream).await?;
+        tracing::debug!(
+            "Handshake/client batch answered for {} ({} subrequests)",
+            peer_addr,
+            subrequests.len()
+        );
+        return Ok(());
+    }
+
+    // Persistent upstream stream for non-handshake traffic after connect.
+    for req in &subrequests {
+        session.track_request(req);
+    }
+    if let Some(ref mut idx) = indexer_stream {
+        idx.write_all(line_bytes).await?;
+        idx.write_all(b"\n").await?;
+        idx.flush().await?;
+    }
+    flush_deferred_indexer_out(session, client_stream).await?;
+    Ok(())
+}
+
 async fn handle_connection(
     pool_manager: Arc<PoolManager>,
     config: Arc<Mutex<Config>>,
@@ -970,15 +1101,13 @@ async fn handle_connection(
         cfg.indexer.as_ref().map(|idx| idx.url.clone())
     };
 
-    // Never block the wallet handshake waiting for upstream electrs.
+    // Delay upstream electrs until after the first client RPC line (Sparrow handshake).
     let mut indexer_stream: Option<IndexerStream> = None;
-    let mut indexer_connect = indexer_url_opt.as_ref().map(|url| {
-        let url = url.clone();
-        tokio::spawn(async move { connect_indexer(&url).await })
-    });
-    let indexer_url = indexer_url_opt.unwrap_or_default();
+    let mut indexer_connect: Option<tokio::task::JoinHandle<Result<IndexerStream>>> = None;
+    let mut handshake_done = false;
+    let indexer_url = indexer_url_opt.clone().unwrap_or_default();
     tracing::info!(
-        "Electrum session started for {} [{}] (indexer connect in background)",
+        "Electrum session started for {} [{}] (indexer after handshake)",
         peer_addr,
         source_label
     );
@@ -996,122 +1125,35 @@ async fn handle_connection(
                         while let Some(newline_pos) = client_buf.iter().position(|&b| b == b'\n') {
                             let line_bytes = client_buf[..newline_pos].to_vec();
                             client_buf.drain(..=newline_pos);
-
                             let line_str = String::from_utf8_lossy(&line_bytes).to_string();
 
-                            if line_str.trim().is_empty() {
-                                continue;
-                            }
-
-                            if let Some((id, hex_param)) = extract_broadcast_hex(&line_str) {
-                                if let Err(e) = intercept_and_handle_broadcast(
-                                    &mut client_stream,
-                                    id,
-                                    hex_param,
-                                    &pool_manager,
-                                    &config,
-                                    &indexer_url,
-                                    source_label,
-                                    &session,
-                                )
-                                .await
-                                {
-                                    tracing::error!("Broadcast handler error ({}): {}", source_label, e);
-                                }
-                                continue;
-                            }
-
-                            if line_looks_like_broadcast(&line_str) {
-                                let id = line_json_rpc_id(&line_str);
-                                tracing::error!(
-                                    "Unparsed broadcast request (not forwarding to indexer, id={}): {}",
-                                    id,
-                                    &line_str[..line_str.len().min(240)]
-                                );
-                                write_json_rpc_response(
-                                    &mut client_stream,
-                                    &serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "error": { "code": -32602, "message": "Invalid broadcast params" },
-                                        "id": id
-                                    }),
-                                )
-                                .await?;
-                                continue;
-                            }
-
-                            let batch = line_is_batch(&line_str);
-                            let subrequests = match parse_subrequests(&line_str) {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    tracing::warn!("Invalid client JSON from {}: {}", peer_addr, e);
-                                    continue;
-                                }
-                            };
-                            tracing::info!(
-                                "Electrum RPC from {}: [{}]",
+                            process_client_line(
+                                &line_bytes,
+                                &line_str,
                                 peer_addr,
-                                subrequests
-                                    .iter()
-                                    .map(|r| r.method.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
+                                &pool_manager,
+                                &config,
+                                &indexer_url,
+                                &mut indexer_stream,
+                                &mut session,
+                                source_label,
+                                &mut client_stream,
+                            )
+                            .await?;
 
-                            // Handshake methods must always be answered locally — on Umbrel
-                            // electrs connects instantly so forwarding the whole batch breaks Sparrow.
-                            if batch_contains_local_handshake(&subrequests) {
-                                let mut responses = Vec::with_capacity(subrequests.len());
-                                for req in &subrequests {
-                                    responses.push(
-                                        handle_one_subrequest(
-                                            req,
-                                            &pool_manager,
-                                            &config,
-                                            &indexer_url,
-                                            &mut indexer_stream,
-                                            &mut session,
-                                            source_label,
-                                            &mut client_stream,
-                                        )
-                                        .await?,
+                            if !handshake_done {
+                                handshake_done = true;
+                                if let Some(ref url) = indexer_url_opt {
+                                    let url = url.clone();
+                                    tracing::info!(
+                                        "Opening upstream electrs for {} after handshake",
+                                        peer_addr
                                     );
+                                    indexer_connect = Some(tokio::spawn(async move {
+                                        connect_indexer(&url).await
+                                    }));
                                 }
-                                write_client_responses(&mut client_stream, &responses, batch).await?;
-                                continue;
                             }
-
-                            // Persistent upstream stream: forward whole line (batch or single).
-                            if indexer_stream.is_some() {
-                                for req in &subrequests {
-                                    session.track_request(req);
-                                }
-                                if let Some(ref mut idx) = indexer_stream {
-                                    idx.write_all(&line_bytes).await?;
-                                    idx.write_all(b"\n").await?;
-                                    idx.flush().await?;
-                                }
-                                continue;
-                            }
-
-                            // No upstream stream yet — answer each subrequest (batch → JSON array).
-                            let mut responses = Vec::with_capacity(subrequests.len());
-                            for req in &subrequests {
-                                responses.push(
-                                    handle_one_subrequest(
-                                        req,
-                                        &pool_manager,
-                                        &config,
-                                        &indexer_url,
-                                        &mut indexer_stream,
-                                        &mut session,
-                                        source_label,
-                                        &mut client_stream,
-                                    )
-                                    .await?,
-                                );
-                            }
-                            write_client_responses(&mut client_stream, &responses, batch).await?;
                         }
                     }
                     Err(e) => {
@@ -1126,7 +1168,7 @@ async fn handle_connection(
                 } else {
                     std::future::pending().await
                 }
-            }, if indexer_connect.is_some() && indexer_stream.is_none() => {
+            }, if handshake_done && indexer_connect.is_some() && indexer_stream.is_none() => {
                 indexer_connect = None;
                 match result {
                     Ok(Ok(s)) => {
@@ -1163,7 +1205,12 @@ async fn handle_connection(
                                 &pool_manager,
                                 &indexer_url,
                             )?;
-                            client_stream.write_all(&out).await?;
+                            if session.client_busy {
+                                session.deferred_indexer_out.push(out);
+                            } else {
+                                client_stream.write_all(&out).await?;
+                                client_stream.flush().await?;
+                            }
                         }
                     }
                     Err(e) => {
