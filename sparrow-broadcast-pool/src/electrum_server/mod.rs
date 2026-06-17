@@ -509,7 +509,18 @@ const LOCAL_ELECTRUM_METHODS: &[&str] = &[
     "server.version",
     "server.banner",
     "server.ping",
+    "server.features",
 ];
+
+fn is_local_handshake_method(method: &str) -> bool {
+    LOCAL_ELECTRUM_METHODS.contains(&method)
+}
+
+fn batch_contains_local_handshake(subrequests: &[JsonRpcRequest]) -> bool {
+    subrequests
+        .iter()
+        .any(|r| is_local_handshake_method(&r.method))
+}
 
 fn parse_subrequests(line: &str) -> Result<Vec<JsonRpcRequest>> {
     let v = serde_json::from_str::<serde_json::Value>(line.trim()).context("invalid JSON")?;
@@ -563,14 +574,10 @@ async fn handle_one_subrequest(
     source_label: &str,
     client_stream: &mut tokio::net::TcpStream,
 ) -> Result<serde_json::Value> {
-    if LOCAL_ELECTRUM_METHODS.contains(&request.method.as_str()) {
+    if is_local_handshake_method(&request.method) {
         return local_electrum_response(request, config).ok_or_else(|| {
             anyhow::anyhow!("no local response for {}", request.method)
         });
-    }
-
-    if request.method == "server.features" && !indexer_url.is_empty() {
-        return forward_subrequest_sync(request, indexer_url, session, pool_manager).await;
     }
 
     if request.method == "blockchain.transaction.get" {
@@ -1051,6 +1058,29 @@ async fn handle_connection(
                                     .join(", ")
                             );
 
+                            // Handshake methods must always be answered locally — on Umbrel
+                            // electrs connects instantly so forwarding the whole batch breaks Sparrow.
+                            if batch_contains_local_handshake(&subrequests) {
+                                let mut responses = Vec::with_capacity(subrequests.len());
+                                for req in &subrequests {
+                                    responses.push(
+                                        handle_one_subrequest(
+                                            req,
+                                            &pool_manager,
+                                            &config,
+                                            &indexer_url,
+                                            &mut indexer_stream,
+                                            &mut session,
+                                            source_label,
+                                            &mut client_stream,
+                                        )
+                                        .await?,
+                                    );
+                                }
+                                write_client_responses(&mut client_stream, &responses, batch).await?;
+                                continue;
+                            }
+
                             // Persistent upstream stream: forward whole line (batch or single).
                             if indexer_stream.is_some() {
                                 for req in &subrequests {
@@ -1059,6 +1089,7 @@ async fn handle_connection(
                                 if let Some(ref mut idx) = indexer_stream {
                                     idx.write_all(&line_bytes).await?;
                                     idx.write_all(b"\n").await?;
+                                    idx.flush().await?;
                                 }
                                 continue;
                             }

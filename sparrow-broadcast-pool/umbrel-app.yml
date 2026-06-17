@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.2.13"
+version: "0.2.14"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,7 +31,7 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.2.13 — Fix Sparrow stuck on Connecting (JSON-RPC batch handshake).
+  v0.2.14 — Fix Sparrow stuck on Connecting (JSON-RPC batch handshake).
 
   - Parse and respond to JSON-RPC batch requests on connect (server.version, etc.)
 
