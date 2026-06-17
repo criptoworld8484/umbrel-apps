@@ -15,7 +15,8 @@ RUN useradd -m -u 1000 app
 
 COPY --from=builder /build/target/release/broadcast-pool /usr/local/bin/broadcast-pool
 COPY src/api/dashboard.html /home/app/dashboard.html
-RUN chown -R app:app /home/app
+COPY entrypoint.sh /home/app/entrypoint.sh
+RUN chmod +x /home/app/entrypoint.sh && chown -R app:app /home/app
 
 USER app
 WORKDIR /home/app
@@ -26,4 +27,4 @@ ENV BROADCAST_POOL_WEB_HOST=0.0.0.0
 ENV BROADCAST_POOL_ELECTRUM_HOST=0.0.0.0
 
 EXPOSE 8080 50050
-CMD ["broadcast-pool", "start", "--foreground"]
+ENTRYPOINT ["/home/app/entrypoint.sh"]

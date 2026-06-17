@@ -368,7 +368,12 @@ async fn main() -> Result<()> {
     // Auto-detect network (Bitcoin RPC), indexer (50001/50002), and LAN IP for wallet URL.
     discovery::apply_network_from_rpc(&mut config, rpc.as_deref());
     let indexer_before = config.indexer.clone();
-    let indexer_found = discovery::apply_indexer_discovery(&mut config);
+    let indexer_found = if discovery::is_umbrel_mode() {
+        discovery::heal_umbrel_indexer_config(&mut config);
+        config.indexer.is_some()
+    } else {
+        discovery::apply_indexer_discovery(&mut config)
+    };
     discovery::apply_lan_ip(&mut config);
     let config_changed = indexer_before != config.indexer;
     if indexer_found || (discovery::is_umbrel_mode() && config_changed) {

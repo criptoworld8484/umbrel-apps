@@ -97,8 +97,13 @@ fn config_to_response(config: &Config, network_changed: bool) -> ConfigResponse 
     let pinned = std::env::var("BROADCAST_POOL_INDEXER_URL").is_ok();
     let indexer = config.indexer.as_ref();
     let active_url = indexer.map(|i| i.url.as_str()).unwrap_or("");
-    let is_manual = indexer.map(|i| i.manual_override).unwrap_or(false);
-    let node_display = if active_url.is_empty() {
+    let is_manual = indexer.map(|i| i.manual_override).unwrap_or(false)
+        && crate::discovery::extract_indexer_host(active_url)
+            .is_none_or(|h| !crate::discovery::is_mistaken_umbrel_lan_override(&h));
+    let node_display = if active_url.is_empty()
+        || crate::discovery::extract_indexer_host(active_url)
+            .is_some_and(|h| crate::discovery::is_mistaken_umbrel_lan_override(&h))
+    {
         String::new()
     } else {
         crate::discovery::display_indexer_url(active_url)
@@ -415,15 +420,8 @@ async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut reconnect = false;
     if crate::discovery::is_umbrel_mode() {
-        let had_mistaken = config.indexer.as_ref().and_then(|i| {
-            crate::discovery::extract_indexer_host(&i.url)
-                .filter(|h| crate::discovery::is_mistaken_umbrel_lan_override(h))
-        });
-        if had_mistaken.is_some() {
-            config.indexer = None;
-            if crate::discovery::apply_indexer_discovery(&mut config) {
-                reconnect = true;
-            }
+        if crate::discovery::heal_umbrel_indexer_config(&mut config) {
+            reconnect = true;
             let _ = crate::discovery::save_config_to_disk(&config);
         }
     }
@@ -496,6 +494,13 @@ async fn save_config(
                 false
             }
         } else {
+            if crate::discovery::is_umbrel_mode() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "On Umbrel the node electrs is used automatically. Leave the external indexer field empty."
+                        .to_string(),
+                ));
+            }
             if let Some(host) = crate::discovery::extract_indexer_host(&url) {
                 if crate::discovery::is_mistaken_umbrel_lan_override(&host) {
                     return Err((
@@ -569,6 +574,18 @@ async fn save_config(
 async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     let pool_manager = state.pool_manager.clone();
     let config = state.config.clone();
+    let mut reconnect = false;
+    if let Ok(mut cfg) = state.config.lock() {
+        if crate::discovery::heal_umbrel_indexer_config(&mut cfg) {
+            let _ = crate::discovery::save_config_to_disk(&cfg);
+            reconnect = true;
+        }
+    }
+    if reconnect {
+        if let Err(e) = pool_manager.reconnect_indexer_from_config() {
+            tracing::warn!("Could not reconnect indexer after status heal: {}", e);
+        }
+    }
 
     let result = tokio::task::spawn_blocking(move || {
         let stats = pool_manager.get_stats().map_err(|e| e.to_string())?;

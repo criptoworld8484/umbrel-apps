@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.2.2"
+version: "0.2.3"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,13 +31,13 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.2.2 — Fix descubrimiento del indexador en Umbrel.
+  v0.2.3 — Entrypoint Umbrel + URL electrs inyectada al arrancar.
 
-  - Config persistente en el volumen de datos (/home/app/data)
+  - Construye tcp/ssl desde APP_ELECTRS_NODE_IP en el entrypoint
 
-  - Elimina URLs LAN erróneas (192.168.x) al arrancar y al abrir Settings
+  - Oculta el campo de indexador externo en Umbrel
 
-  - Conecta via APP_ELECTRS_NODE_IP (red Docker 10.21.x)
+  - Auto-limpia config LAN errónea en cada status/settings load
 developer: criptoworld8484
 website: https://github.com/criptoworld8484/umbrel-apps
 repo: https://github.com/criptoworld8484/umbrel-apps/tree/master/sparrow-broadcast-pool

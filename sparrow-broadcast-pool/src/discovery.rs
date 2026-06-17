@@ -278,6 +278,32 @@ fn umbrel_indexer_ports() -> Vec<u16> {
 
 /// Connect only to the Umbrel electrs container (never LAN scan).
 pub fn discover_umbrel_node_indexer(network: &NetworkType) -> Option<String> {
+    for key in [
+        "BROADCAST_POOL_UMBREL_ELECTRS_TCP",
+        "BROADCAST_POOL_UMBREL_ELECTRS_SSL",
+        "BROADCAST_POOL_INDEXER_URL",
+    ] {
+        if let Ok(raw) = std::env::var(key) {
+            let raw = raw.trim();
+            if raw.is_empty() || raw.contains("${") {
+                continue;
+            }
+            if let Some(url) = resolve_working_indexer_url(raw, network) {
+                tracing::info!(
+                    "Umbrel indexer from {} → {}",
+                    key,
+                    display_indexer_url(&url)
+                );
+                return Some(url);
+            }
+            tracing::warn!(
+                "Umbrel indexer candidate from {} unreachable: {}",
+                key,
+                display_indexer_url(raw)
+            );
+        }
+    }
+
     let hosts = umbrel_indexer_hosts();
     let ports = umbrel_indexer_ports();
     if let Ok(ip) = std::env::var("APP_ELECTRS_NODE_IP") {
@@ -354,6 +380,38 @@ fn clear_mistaken_umbrel_lan_override(config: &mut Config) -> bool {
         return true;
     }
     false
+}
+
+/// Strip mistaken LAN indexer config and reconnect to the node electrs on Umbrel.
+pub fn heal_umbrel_indexer_config(config: &mut Config) -> bool {
+    if !is_umbrel_mode() {
+        return false;
+    }
+    let mut changed = clear_mistaken_umbrel_lan_override(config);
+    if config
+        .indexer
+        .as_ref()
+        .is_some_and(|i| i.manual_override)
+    {
+        config.indexer = None;
+        changed = true;
+    }
+    let needs_discover = config.indexer.is_none()
+        || config
+            .indexer
+            .as_ref()
+            .and_then(|i| extract_indexer_host(&i.url))
+            .is_some_and(|h| is_mistaken_umbrel_lan_override(&h));
+    if needs_discover {
+        if let Some(url) = discover_umbrel_node_indexer(&config.network.network_type) {
+            config.indexer = Some(crate::config::IndexerConfig {
+                url,
+                manual_override: false,
+            });
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn indexer_ports_to_try() -> Vec<u16> {
