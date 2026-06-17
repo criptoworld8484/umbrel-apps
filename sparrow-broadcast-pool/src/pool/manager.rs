@@ -581,7 +581,7 @@ impl PoolManager {
         self.get_median_time_past_cached()
     }
 
-    fn get_median_time_past_cached(&self) -> Result<u64> {
+    pub fn get_median_time_past_cached(&self) -> Result<u64> {
         const TTL: Duration = Duration::from_secs(10);
         if let Ok(cache) = self.mtp_cache.lock() {
             if let Some((fetched_at, mtp)) = *cache {

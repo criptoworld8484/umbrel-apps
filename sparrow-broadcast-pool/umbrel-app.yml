@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.2.7"
+version: "0.2.8"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,13 +31,13 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.2.7 — Fix block-height Sparrow ingest and Remove button.
+  v0.2.8 — Fix Sparrow block-height/MTP broadcast never reaching pool.
 
-  - Future block nLockTime uses by_block regardless of dashboard mode
+  - Never forward blockchain.transaction.broadcast to upstream electrs
 
-  - Fast broadcast response (no blocking prev-tx indexer lookups)
+  - Robust broadcast JSON parsing; 20s handling timeout
 
-  - Remove clears pool DB and virtual mempool
+  - Future timestamp nLockTime uses scheduled (MTP wait), not Immediate
 developer: criptoworld8484
 website: https://github.com/criptoworld8484/umbrel-apps
 repo: https://github.com/criptoworld8484/umbrel-apps/tree/master/sparrow-broadcast-pool

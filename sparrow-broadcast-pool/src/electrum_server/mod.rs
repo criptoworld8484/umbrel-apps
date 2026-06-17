@@ -198,6 +198,26 @@ struct JsonRpcRequest {
     id: serde_json::Value,
 }
 
+/// Parse `blockchain.transaction.broadcast` even when strict struct decode would fail.
+fn extract_broadcast_hex(line: &str) -> Option<(serde_json::Value, String)> {
+    let v = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+    if v.get("method")?.as_str()? != "blockchain.transaction.broadcast" {
+        return None;
+    }
+    let id = v.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let hex = v
+        .get("params")?
+        .as_array()?
+        .first()?
+        .as_str()?
+        .to_string();
+    Some((id, hex))
+}
+
+fn line_looks_like_broadcast(line: &str) -> bool {
+    line.contains("blockchain.transaction.broadcast")
+}
+
 #[derive(Debug, Serialize)]
 struct JsonRpcResponse {
     jsonrpc: String,
@@ -558,13 +578,24 @@ async fn handle_connection(
     };
 
     let mut indexer_stream = match connect_indexer(&indexer_url).await {
-        Ok(s) => s,
+        Ok(s) => Some(s),
         Err(e) => {
-            tracing::warn!("Indexer connect failed ({}): {}", indexer_url, e);
-            return Ok(());
+            tracing::warn!(
+                "Indexer connect failed ({}): {} — serving broadcast intercept only until indexer is up",
+                indexer_url,
+                e
+            );
+            None
         }
     };
-    tracing::debug!("Proxy connection: {} <-> indexer {}", peer_addr, indexer_url);
+    if indexer_stream.is_some() {
+        tracing::debug!("Proxy connection: {} <-> indexer {}", peer_addr, indexer_url);
+    } else {
+        tracing::warn!(
+            "Electrum proxy for {} running without upstream indexer (broadcast pool still accepts txs)",
+            peer_addr
+        );
+    }
 
     let mut client_buf = Vec::new();
     let mut indexer_buf = Vec::new();
@@ -583,6 +614,77 @@ async fn handle_connection(
                             let line_str = String::from_utf8_lossy(&line_bytes).to_string();
 
                             if line_str.trim().is_empty() {
+                                continue;
+                            }
+
+                            // Always intercept broadcast locally — never forward to upstream electrs
+                            // (real electrs rejects non-final txs and Sparrow would hang/error).
+                            if let Some((id, hex_param)) = extract_broadcast_hex(&line_str) {
+                                tracing::info!(
+                                    "INTERCEPTED blockchain.transaction.broadcast (hex len={})",
+                                    hex_param.len()
+                                );
+                                let hex_owned = hex_param;
+                                let pm = pool_manager.clone();
+                                let cfg = config.clone();
+                                let url = indexer_url.clone();
+                                let src = source_label.to_string();
+                                let broadcast_result = tokio::time::timeout(
+                                    std::time::Duration::from_secs(20),
+                                    tokio::task::spawn_blocking(move || {
+                                        handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
+                                    }),
+                                )
+                                .await
+                                .map_err(|_| anyhow::anyhow!("Broadcast handling timed out"))?
+                                .map_err(|e| anyhow::anyhow!("Task join error: {}", e))?;
+
+                                match broadcast_result {
+                                    Ok(result) => {
+                                        tracing::info!("Broadcast retained, txid: {}", result.txid);
+                                        let response = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "result": result.txid,
+                                            "id": id
+                                        });
+                                        client_stream.write_all(&serde_json::to_vec(&response)?).await?;
+                                        client_stream.write_all(b"\n").await?;
+                                        if result.retained {
+                                            notify_subscriptions(
+                                                &mut client_stream,
+                                                &session.subscribed_scripthashes,
+                                                &result.affected_scripthashes,
+                                                pool_manager.clone(),
+                                                indexer_url.clone(),
+                                            ).await?;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Broadcast intercept failed: {}", e);
+                                        let response = serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "error": { "code": -25, "message": e.to_string() },
+                                            "id": id
+                                        });
+                                        client_stream.write_all(&serde_json::to_vec(&response)?).await?;
+                                        client_stream.write_all(b"\n").await?;
+                                    }
+                                }
+                                continue;
+                            }
+
+                            if line_looks_like_broadcast(&line_str) {
+                                tracing::error!(
+                                    "Unparsed broadcast request (not forwarding to indexer): {}",
+                                    &line_str[..line_str.len().min(240)]
+                                );
+                                let response = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "error": { "code": -32602, "message": "Invalid broadcast params" },
+                                    "id": null
+                                });
+                                client_stream.write_all(&serde_json::to_vec(&response)?).await?;
+                                client_stream.write_all(b"\n").await?;
                                 continue;
                             }
 
@@ -610,79 +712,33 @@ async fn handle_connection(
                                     }
                                 }
 
-                                // === Intercept blockchain.transaction.broadcast ===
-                                if request.method == "blockchain.transaction.broadcast" {
-                                    tracing::info!("INTERCEPTED blockchain.transaction.broadcast");
-                                    let id = request.id.clone();
-
-                                    if let Some(params) = request.params.as_ref().and_then(|p| p.as_array()) {
-                                        if let Some(hex_param) = params.get(0).and_then(|v| v.as_str()) {
-                                            tracing::info!("broadcast intercepted, tx_hex length: {}", hex_param.len());
-                                            let hex_owned = hex_param.to_string();
-                                            let pm = pool_manager.clone();
-                                            let cfg = config.clone();
-                                            let url = indexer_url.clone();
-                                            let src = source_label.to_string();
-                                            let broadcast_result = tokio::task::spawn_blocking(move || {
-                                                handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
-                                            }).await.unwrap_or_else(|e| Err(anyhow::anyhow!("Task join error: {}", e)));
-
-                                            match broadcast_result {
-                                                Ok(result) => {
-                                                    tracing::info!("Broadcast successful, txid: {}", result.txid);
-                                                    let response = serde_json::json!({
-                                                        "jsonrpc": "2.0",
-                                                        "result": result.txid,
-                                                        "id": id
-                                                    });
-                                                    client_stream.write_all(&serde_json::to_vec(&response)?).await?;
-                                                    client_stream.write_all(b"\n").await?;
-
-                                                    if result.retained {
-                                                        notify_subscriptions(
-                                                            &mut client_stream,
-                                                            &session.subscribed_scripthashes,
-                                                            &result.affected_scripthashes,
-                                                            pool_manager.clone(),
-                                                            indexer_url.clone(),
-                                                        ).await?;
-                                                    }
-                                                    continue;
-                                                }
-                                                Err(e) => {
-                                                    tracing::error!("Broadcast intercepted but failed: {}", e);
-                                                    let response = serde_json::json!({
-                                                        "jsonrpc": "2.0",
-                                                        "error": { "code": -25, "message": e.to_string() },
-                                                        "id": id
-                                                    });
-                                                    client_stream.write_all(&serde_json::to_vec(&response)?).await?;
-                                                    client_stream.write_all(b"\n").await?;
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    let response = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "error": { "code": -32602, "message": "Invalid params" },
-                                        "id": id
-                                    });
-                                    client_stream.write_all(&serde_json::to_vec(&response)?).await?;
-                                    client_stream.write_all(b"\n").await?;
-                                    continue;
-                                }
-
                                 // Track requests that need response modification
                                 session.track_request(&request);
 
-                                // === Everything else: forward to indexer ===
-                                indexer_stream.write_all(&line_bytes).await?;
-                                indexer_stream.write_all(b"\n").await?;
+                                // === Everything else: forward to indexer when connected ===
+                                if let Some(ref mut idx) = indexer_stream {
+                                    idx.write_all(&line_bytes).await?;
+                                    idx.write_all(b"\n").await?;
+                                } else {
+                                    let response = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "error": {
+                                            "code": -32000,
+                                            "message": "Indexer temporarily unavailable"
+                                        },
+                                        "id": request.id
+                                    });
+                                    client_stream.write_all(&serde_json::to_vec(&response)?).await?;
+                                    client_stream.write_all(b"\n").await?;
+                                }
+                            } else if let Some(ref mut idx) = indexer_stream {
+                                idx.write_all(&line_bytes).await?;
+                                idx.write_all(b"\n").await?;
                             } else {
-                                indexer_stream.write_all(&line_bytes).await?;
-                                indexer_stream.write_all(b"\n").await?;
+                                tracing::debug!(
+                                    "Dropped client line (no indexer, unparsed): {}",
+                                    &line_str[..line_str.len().min(120)]
+                                );
                             }
                         }
                     }
@@ -692,7 +748,12 @@ async fn handle_connection(
                     }
                 }
             }
-            result = indexer_stream.read_buf(&mut indexer_buf) => {
+            result = async {
+                match indexer_stream.as_mut() {
+                    Some(s) => s.read_buf(&mut indexer_buf).await,
+                    None => std::future::pending().await,
+                }
+            }, if indexer_stream.is_some() => {
                 match result {
                     Ok(0) => break,
                     Ok(_) => {
@@ -1060,6 +1121,7 @@ fn resolve_ingest_plan(
     nlocktime: u32,
     config: &Config,
     current_block_height: Option<u64>,
+    current_mtp: Option<u64>,
 ) -> (BroadcastMode, Option<chrono::DateTime<chrono::Utc>>) {
     if source_label == "liana" {
         tracing::info!("Liana ingest → manual scheduling (pending until user sets date/price)");
@@ -1069,7 +1131,7 @@ fn resolve_ingest_plan(
         tracing::info!("Sparrow ingest with nLockTime disabled → manual scheduling");
         return (BroadcastMode::Manual, None);
     }
-    // Block-height nLockTime already satisfied at ingest → manual (date/price scheduling).
+    // Block-height nLockTime
     if nlocktime > 0 && nlocktime < 500_000_000 {
         if let Some(height) = current_block_height {
             if height >= nlocktime as u64 {
@@ -1086,6 +1148,26 @@ fn resolve_ingest_plan(
             nlocktime
         );
         return (BroadcastMode::ByBlock, None);
+    }
+    // Timestamp / MTP nLockTime — never immediate-broadcast at ingest
+    if nlocktime > 500_000_000 {
+        if let Some(mtp) = current_mtp {
+            if (nlocktime as u64) > mtp {
+                tracing::info!(
+                    "Future timestamp nLockTime {} → scheduled (chain MTP {})",
+                    nlocktime,
+                    mtp
+                );
+                return (BroadcastMode::Scheduled, None);
+            }
+        } else {
+            tracing::info!(
+                "Future timestamp nLockTime {} → scheduled (MTP unknown)",
+                nlocktime
+            );
+            return (BroadcastMode::Scheduled, None);
+        }
+        return (BroadcastMode::Manual, None);
     }
     resolve_broadcast_plan(nlocktime, config)
 }
@@ -1168,9 +1250,16 @@ fn handle_broadcast(
     };
 
     let current_block_height = pool_manager.check_block_height().ok().flatten();
+    let current_mtp = pool_manager.get_median_time_past_cached().ok();
     let (broadcast_mode, scheduled_time) = {
         let cfg = config.lock().map_err(|e| anyhow::anyhow!("Config lock: {}", e))?;
-        resolve_ingest_plan(source_label, nlocktime, &cfg, current_block_height)
+        resolve_ingest_plan(
+            source_label,
+            nlocktime,
+            &cfg,
+            current_block_height,
+            current_mtp,
+        )
     };
 
     tracing::info!(

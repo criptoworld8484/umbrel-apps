@@ -498,9 +498,19 @@ async fn save_config(
             if crate::discovery::is_umbrel_mode() {
                 tracing::info!("Clearing manual indexer override — reconnecting to node indexer");
                 config.indexer = None;
-                let found = crate::discovery::apply_indexer_discovery(&mut config);
-                let _ = crate::discovery::save_config_to_disk(&config);
-                found
+                let from_env = std::env::var("BROADCAST_POOL_UMBREL_ELECTRS_TCP")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty() && !v.contains("${"));
+                if let Some(tcp_url) = from_env {
+                    config.indexer = Some(crate::config::IndexerConfig {
+                        url: tcp_url,
+                        manual_override: false,
+                    });
+                    true
+                } else {
+                    crate::discovery::discover_umbrel_if_needed(&mut config, true)
+                }
             } else {
                 false
             }
