@@ -450,9 +450,9 @@ async fn main() -> Result<()> {
             );
 
             let app_state = api::AppState {
-                pool_manager,
+                pool_manager: pool_manager.clone(),
                 db,
-                config: shared_config,
+                config: shared_config.clone(),
             };
             let app = api::router(app_state);
             let bind_addr = format!("{}:{}", config.web.host, config.web.port);
@@ -469,6 +469,65 @@ async fn main() -> Result<()> {
 
             let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
             tracing::info!("Server listening on {}", bind_addr);
+
+            if discovery::is_umbrel_mode() && config.indexer.is_none() {
+                let pm = pool_manager.clone();
+                let cfg = shared_config.clone();
+                tokio::spawn(async move {
+                    tracing::info!(
+                        "Umbrel electrs not found at startup — retrying discovery every 15s"
+                    );
+                    for attempt in 1..=40 {
+                        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                        if pm.get_indexer().is_some() {
+                            break;
+                        }
+                        let reconnect = tokio::task::spawn_blocking({
+                            let pm = pm.clone();
+                            let cfg = cfg.clone();
+                            move || -> bool {
+                                let mut c = match cfg.lock() {
+                                    Ok(c) => c,
+                                    Err(_) => return false,
+                                };
+                                if c.indexer.is_some() {
+                                    return false;
+                                }
+                                if !discovery::discover_umbrel_if_needed(&mut c, true) {
+                                    return false;
+                                }
+                                if c.indexer.is_none() {
+                                    return false;
+                                }
+                                let _ = discovery::save_config_to_disk(&c);
+                                drop(c);
+                                match pm.reconnect_indexer_from_config() {
+                                    Ok(()) => {
+                                        tracing::info!(
+                                            "Umbrel electrs connected after background retry #{}",
+                                            attempt
+                                        );
+                                        true
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Background electrs reconnect failed (attempt {}): {}",
+                                            attempt,
+                                            e
+                                        );
+                                        false
+                                    }
+                                }
+                            }
+                        })
+                        .await
+                        .unwrap_or(false);
+                        if reconnect {
+                            break;
+                        }
+                    }
+                });
+            }
 
             tokio::spawn(async move {
                 if let Err(e) = electrum_server.start().await {

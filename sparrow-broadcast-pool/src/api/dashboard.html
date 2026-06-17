@@ -2268,6 +2268,11 @@
                         dot.style.boxShadow = '0 0 8px var(--green)';
                         text.textContent = t('cfg_connected');
                         text.style.color = 'var(--green)';
+                        const hint = document.getElementById('indexer-status-hint');
+                        if (hint) {
+                            hint.textContent = appUmbrelMode ? t('cfg_indexer_status_hint') : t('cfg_indexer_status_hint_dev');
+                            hint.style.color = 'var(--text-dim)';
+                        }
                         if (status.indexer_height) {
                             let heightText = `Block height: ${status.indexer_height}`;
                             if (status.chain_mtp) {
@@ -2287,6 +2292,11 @@
                         dot.style.background = 'var(--red)';
                         text.textContent = t('cfg_disconnected');
                         text.style.color = 'var(--red)';
+                        const hint = document.getElementById('indexer-status-hint');
+                        if (hint && status.indexer_status_hint) {
+                            hint.textContent = status.indexer_status_hint;
+                            hint.style.color = 'var(--amber)';
+                        }
                     }
                 }
             } catch (e) {
@@ -2449,6 +2459,7 @@
 
         refresh();
         loadConfig();
+        checkIndexerStatus();
         updateActiveNetwork();
         setInterval(refresh, 5000);
         setInterval(checkIndexerStatus, 10000);

@@ -2,12 +2,18 @@
 
 use crate::config::{Config, NetworkType};
 use crate::rpc::{BitcoinRpc, ElectrumClient};
+use serde::Serialize;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub const INDEXER_PORTS: [u16; 2] = [50001, 50002];
 const BROADER_PORT_RANGE: std::ops::RangeInclusive<u16> = 50000..=50010;
 const TCP_PROBE_MS: u64 = 150;
+const UMBREL_TCP_CONNECT_SECS: u64 = 2;
+const UMBREL_DISCOVERY_COOLDOWN: Duration = Duration::from_secs(45);
+
+static LAST_UMBREL_DISCOVERY: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Map Bitcoin Core `getblockchaininfo().chain` to our network type.
 pub fn network_from_bitcoin_chain(chain: &str) -> NetworkType {
@@ -163,19 +169,30 @@ pub fn display_indexer_url(url: &str) -> String {
     strip_indexer_scheme(url).trim().to_string()
 }
 
+fn umbrel_electrs_ssl_configured() -> bool {
+    env_nonempty("APP_ELECTRS_NODE_SSL_PORT").is_some()
+}
+
 /// All TCP/SSL combinations for standard Electrs/Fulcrum ports on one host.
 /// Order per IP: 50001/tcp, 50001/ssl, 50002/tcp, 50002/ssl.
+/// Umbrel electrs serves plain TCP only unless APP_ELECTRS_NODE_SSL_PORT is set.
 pub fn candidate_urls_for_host(host: &str, ports: &[u16]) -> Vec<String> {
     let mut urls = Vec::new();
+    let umbrel_tcp_only = is_umbrel_mode() && !umbrel_electrs_ssl_configured();
     for &port in ports {
         urls.push(format!("tcp://{}:{}", host, port));
-        urls.push(format!("ssl://{}:{}", host, port));
+        if !umbrel_tcp_only {
+            urls.push(format!("ssl://{}:{}", host, port));
+        }
     }
     urls
 }
 
 /// Connection attempts for a host/port (both TCP and SSL).
 pub fn candidate_urls_for_host_port(host: &str, port: u16) -> Vec<String> {
+    if is_umbrel_mode() && !umbrel_electrs_ssl_configured() {
+        return vec![format!("tcp://{}:{}", host, port)];
+    }
     if port == 50002 {
         vec![
             format!("ssl://{}:{}", host, port),
@@ -268,9 +285,14 @@ fn umbrel_indexer_ports() -> Vec<u16> {
             ports.push(n);
         }
     }
-    for p in INDEXER_PORTS {
-        if !ports.contains(&p) {
-            ports.push(p);
+    if ports.is_empty() {
+        ports.push(50001);
+    }
+    if !is_umbrel_mode() {
+        for p in INDEXER_PORTS {
+            if !ports.contains(&p) {
+                ports.push(p);
+            }
         }
     }
     ports
@@ -278,11 +300,16 @@ fn umbrel_indexer_ports() -> Vec<u16> {
 
 /// Connect only to the Umbrel electrs container (never LAN scan).
 pub fn discover_umbrel_node_indexer(network: &NetworkType) -> Option<String> {
-    for key in [
+    let mut env_keys = vec![
         "BROADCAST_POOL_UMBREL_ELECTRS_TCP",
-        "BROADCAST_POOL_UMBREL_ELECTRS_SSL",
         "BROADCAST_POOL_INDEXER_URL",
-    ] {
+    ];
+    if umbrel_electrs_ssl_configured()
+        || env_nonempty("BROADCAST_POOL_UMBREL_ELECTRS_SSL").is_some()
+    {
+        env_keys.insert(1, "BROADCAST_POOL_UMBREL_ELECTRS_SSL");
+    }
+    for key in env_keys {
         if let Ok(raw) = std::env::var(key) {
             let raw = raw.trim();
             if raw.is_empty() || raw.contains("${") {
@@ -382,8 +409,9 @@ fn clear_mistaken_umbrel_lan_override(config: &mut Config) -> bool {
     false
 }
 
-/// Strip mistaken LAN indexer config and reconnect to the node electrs on Umbrel.
-pub fn heal_umbrel_indexer_config(config: &mut Config) -> bool {
+/// Fast Umbrel heal: remove mistaken wallet-LAN indexer URLs and manual overrides only.
+/// Does not run electrs discovery (safe for /api/status polling).
+pub fn sanitize_umbrel_indexer_config(config: &mut Config) -> bool {
     if !is_umbrel_mode() {
         return false;
     }
@@ -396,22 +424,177 @@ pub fn heal_umbrel_indexer_config(config: &mut Config) -> bool {
         config.indexer = None;
         changed = true;
     }
-    let needs_discover = config.indexer.is_none()
-        || config
-            .indexer
-            .as_ref()
-            .and_then(|i| extract_indexer_host(&i.url))
-            .is_some_and(|h| is_mistaken_umbrel_lan_override(&h));
-    if needs_discover {
-        if let Some(url) = discover_umbrel_node_indexer(&config.network.network_type) {
-            config.indexer = Some(crate::config::IndexerConfig {
-                url,
-                manual_override: false,
-            });
-            changed = true;
+    changed
+}
+
+/// Discover Umbrel electrs when missing; `force` skips cooldown (startup / manual discover).
+pub fn discover_umbrel_if_needed(config: &mut Config, force: bool) -> bool {
+    if !is_umbrel_mode() {
+        return false;
+    }
+    let mut changed = sanitize_umbrel_indexer_config(config);
+    if config.indexer.is_some() {
+        return changed;
+    }
+    if !force {
+        if let Ok(guard) = LAST_UMBREL_DISCOVERY.lock() {
+            if let Some(t) = *guard {
+                if t.elapsed() < UMBREL_DISCOVERY_COOLDOWN {
+                    tracing::debug!("Skipping Umbrel electrs discovery (cooldown)");
+                    return changed;
+                }
+            }
         }
     }
+    if let Some(url) = discover_umbrel_node_indexer(&config.network.network_type) {
+        config.indexer = Some(crate::config::IndexerConfig {
+            url,
+            manual_override: false,
+        });
+        changed = true;
+    }
+    if let Ok(mut guard) = LAST_UMBREL_DISCOVERY.lock() {
+        *guard = Some(Instant::now());
+    }
     changed
+}
+
+/// Strip mistaken LAN indexer config and reconnect to the node electrs on Umbrel.
+pub fn heal_umbrel_indexer_config(config: &mut Config) -> bool {
+    discover_umbrel_if_needed(config, true)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct UmbrelIndexerDiagnostics {
+    pub umbrel_mode: bool,
+    pub app_electrs_node_ip: Option<String>,
+    pub app_electrs_node_port: Option<String>,
+    pub app_electrs_node_ssl_port: Option<String>,
+    pub umbrel_electrs_tcp_env: Option<String>,
+    pub umbrel_electrs_ssl_env: Option<String>,
+    pub configured_indexer_url: Option<String>,
+    pub configured_indexer_reachable: Option<bool>,
+    pub network: String,
+    pub status_hint: String,
+    pub boot_log_tail: Option<String>,
+}
+
+fn umbrel_electrs_probe_failure(network: &NetworkType) -> Option<HostProbeFailure> {
+    let hosts = umbrel_indexer_hosts();
+    let ports = umbrel_indexer_ports();
+    if hosts.is_empty() {
+        return None;
+    }
+    let mut last = HostProbeFailure::TcpRefused;
+    for host in &hosts {
+        match try_host(network, host, &ports) {
+            Ok(_) => return None,
+            Err(failure) => last = failure,
+        }
+    }
+    Some(last)
+}
+
+fn network_mismatch_hint(network: &NetworkType) -> &'static str {
+    match network {
+        NetworkType::Signet => {
+            "Electrs responds but is not on signet — reinstall or reconfigure Electrs for signet (must match Bitcoin Core chain=signet)"
+        }
+        NetworkType::Mainnet => {
+            "Electrs responds but is not on mainnet — verify Electrs matches Bitcoin Core"
+        }
+        NetworkType::Testnet4 => {
+            "Electrs responds but is not on testnet — verify Electrs matches Bitcoin Core"
+        }
+    }
+}
+
+pub fn umbrel_indexer_status_hint(config: &Config, connected: bool) -> String {
+    if !is_umbrel_mode() {
+        return String::new();
+    }
+    if connected {
+        return String::new();
+    }
+    let ip = std::env::var("APP_ELECTRS_NODE_IP")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if ip.is_empty() || ip.contains("${") {
+        return "APP_ELECTRS_NODE_IP is not set — install Electrs and list it as a dependency"
+            .to_string();
+    }
+    let network = &config.network.network_type;
+    if let Some(failure) = umbrel_electrs_probe_failure(network) {
+        return match failure {
+            HostProbeFailure::GenesisMismatch => network_mismatch_hint(network).to_string(),
+            HostProbeFailure::TcpRefused => {
+                let ports = umbrel_indexer_ports();
+                let port_list: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
+                format!(
+                    "Cannot reach electrs at {} (TCP refused on port{}) — ensure the Electrs container is running and fully started",
+                    ip,
+                    if port_list.len() == 1 {
+                        format!(" {}", port_list[0])
+                    } else {
+                        format!("s {}", port_list.join("/"))
+                    }
+                )
+            }
+        };
+    }
+    if let Some(ref idx) = config.indexer {
+        return format!(
+            "Indexer {} not responding — check Electrs is running",
+            display_indexer_url(&idx.url)
+        );
+    }
+    format!(
+        "Cannot reach electrs at {} (ports 50001/50002) — ensure Electrs is synced and running",
+        ip
+    )
+}
+
+fn read_boot_log_tail(max_lines: usize) -> Option<String> {
+    let dir = std::env::var("BROADCAST_POOL_DATA_DIR").ok()?;
+    let path = std::path::PathBuf::from(dir).join("umbrel-boot.log");
+    let content = std::fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    Some(lines[start..].join("\n"))
+}
+
+pub fn umbrel_indexer_diagnostics(config: &Config, connected: bool) -> UmbrelIndexerDiagnostics {
+    let configured = config.indexer.as_ref().map(|i| i.url.clone());
+    let reachable = configured.as_ref().map(|url| {
+        resolve_working_indexer_url(url, &config.network.network_type).is_some()
+    });
+    UmbrelIndexerDiagnostics {
+        umbrel_mode: is_umbrel_mode(),
+        app_electrs_node_ip: env_nonempty("APP_ELECTRS_NODE_IP"),
+        app_electrs_node_port: env_nonempty("APP_ELECTRS_NODE_PORT"),
+        app_electrs_node_ssl_port: env_nonempty("APP_ELECTRS_NODE_SSL_PORT"),
+        umbrel_electrs_tcp_env: env_nonempty("BROADCAST_POOL_UMBREL_ELECTRS_TCP"),
+        umbrel_electrs_ssl_env: env_nonempty("BROADCAST_POOL_UMBREL_ELECTRS_SSL"),
+        configured_indexer_url: configured
+            .as_ref()
+            .map(|u| display_indexer_url(u)),
+        configured_indexer_reachable: reachable,
+        network: config.network.network_type.data_dir_name().to_string(),
+        status_hint: umbrel_indexer_status_hint(config, connected),
+        boot_log_tail: read_boot_log_tail(20),
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().and_then(|v| {
+        let t = v.trim().to_string();
+        if t.is_empty() || t.contains("${") {
+            None
+        } else {
+            Some(t)
+        }
+    })
 }
 
 fn indexer_ports_to_try() -> Vec<u16> {
@@ -432,12 +615,20 @@ fn indexer_ports_to_try() -> Vec<u16> {
     ports
 }
 
+fn tcp_connect_timeout() -> Duration {
+    if is_umbrel_mode() {
+        Duration::from_secs(UMBREL_TCP_CONNECT_SECS)
+    } else {
+        Duration::from_millis(TCP_PROBE_MS)
+    }
+}
+
 fn tcp_port_open(host: &str, port: u16) -> bool {
     let addr = format!("{}:{}", host, port);
     let Ok(addrs) = addr.to_socket_addrs() else {
         return false;
     };
-    let timeout = Duration::from_millis(TCP_PROBE_MS);
+    let timeout = tcp_connect_timeout();
     for socket_addr in addrs {
         if TcpStream::connect_timeout(&socket_addr, timeout).is_ok() {
             return true;
@@ -468,46 +659,131 @@ fn lan_subnet_hosts(lan_ip: &str) -> Vec<String> {
         .collect()
 }
 
-fn try_host(network: &NetworkType, host: &str, ports: &[u16]) -> Option<String> {
-    for url in candidate_urls_for_host(host, ports) {
-        if !tcp_reachable_from_url(&url) {
-            tracing::debug!("Indexer probe skip (port closed): {}", display_indexer_url(&url));
-            continue;
-        }
-        if crate::rpc::indexer_transport::probe_working_url(&[url.clone()]).is_none() {
-            tracing::debug!("Indexer probe skip (no RPC): {}", display_indexer_url(&url));
-            continue;
-        }
-        let client = match ElectrumClient::new(&url) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        if client.genesis_matches_network(network).unwrap_or(false) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexerProbeOutcome {
+    TcpRefused,
+    RpcFailed,
+    GenesisMismatch,
+    Ok,
+}
+
+fn probe_indexer_url(url: &str, network: &NetworkType) -> IndexerProbeOutcome {
+    if !tcp_reachable_from_url(url) {
+        return IndexerProbeOutcome::TcpRefused;
+    }
+    if crate::rpc::indexer_transport::probe_working_url(&[url.to_string()]).is_none() {
+        return IndexerProbeOutcome::RpcFailed;
+    }
+    let client = match ElectrumClient::new(url) {
+        Ok(c) => c,
+        Err(_) => return IndexerProbeOutcome::RpcFailed,
+    };
+    if client.genesis_matches_network(network).unwrap_or(false) {
+        IndexerProbeOutcome::Ok
+    } else {
+        IndexerProbeOutcome::GenesisMismatch
+    }
+}
+
+fn log_indexer_probe(url: &str, network: &NetworkType, outcome: IndexerProbeOutcome) {
+    let display_url = display_indexer_url(url);
+    let expected = network.data_dir_name();
+    match outcome {
+        IndexerProbeOutcome::Ok => {
             tracing::info!(
                 "Indexer OK at {} (genesis matches {})",
-                display_indexer_url(&url),
-                network.data_dir_name()
+                display_url,
+                expected
             );
-            return Some(url);
         }
-        tracing::debug!(
-            "Indexer at {} reachable but genesis mismatch for {}",
-            display_indexer_url(&url),
+        IndexerProbeOutcome::TcpRefused => {
+            if is_umbrel_mode() {
+                tracing::warn!(
+                    "Umbrel indexer candidate unreachable (TCP refused): {}",
+                    display_url
+                );
+            } else {
+                tracing::debug!("Indexer probe skip (port closed): {}", display_url);
+            }
+        }
+        IndexerProbeOutcome::RpcFailed => {
+            tracing::debug!("Indexer probe skip (no RPC): {}", display_url);
+        }
+        IndexerProbeOutcome::GenesisMismatch => {
+            tracing::warn!(
+                "Umbrel indexer candidate reachable but genesis mismatch (expected {}): {}",
+                expected,
+                display_url
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostProbeFailure {
+    TcpRefused,
+    GenesisMismatch,
+}
+
+fn try_host(network: &NetworkType, host: &str, ports: &[u16]) -> Result<String, HostProbeFailure> {
+    let mut saw_tcp_open = false;
+    let mut saw_genesis_mismatch = false;
+    for url in candidate_urls_for_host(host, ports) {
+        let outcome = probe_indexer_url(&url, network);
+        log_indexer_probe(&url, network, outcome);
+        match outcome {
+            IndexerProbeOutcome::Ok => return Ok(url),
+            IndexerProbeOutcome::TcpRefused => {}
+            IndexerProbeOutcome::RpcFailed => saw_tcp_open = true,
+            IndexerProbeOutcome::GenesisMismatch => {
+                saw_tcp_open = true;
+                saw_genesis_mismatch = true;
+            }
+        }
+    }
+    if saw_genesis_mismatch {
+        tracing::warn!(
+            "Umbrel electrs at {} responds but genesis does not match {} — check Bitcoin Core and Electrs use the same network",
+            host,
             network.data_dir_name()
         );
+        Err(HostProbeFailure::GenesisMismatch)
+    } else if saw_tcp_open {
+        Err(HostProbeFailure::TcpRefused)
+    } else {
+        Err(HostProbeFailure::TcpRefused)
     }
-    None
 }
 
 fn try_hosts_ports(network: &NetworkType, hosts: &[String], ports: &[u16]) -> Option<String> {
+    let mut last_failure = HostProbeFailure::TcpRefused;
     for host in hosts {
-        if let Some(url) = try_host(network, host, ports) {
-            tracing::info!(
-                "Auto-detected indexer at {} (genesis matches {})",
-                display_indexer_url(&url),
-                network.data_dir_name()
-            );
-            return Some(url);
+        match try_host(network, host, ports) {
+            Ok(url) => {
+                tracing::info!(
+                    "Auto-detected indexer at {} (genesis matches {})",
+                    display_indexer_url(&url),
+                    network.data_dir_name()
+                );
+                return Some(url);
+            }
+            Err(failure) => last_failure = failure,
+        }
+    }
+    if is_umbrel_mode() {
+        match last_failure {
+            HostProbeFailure::GenesisMismatch => {
+                tracing::warn!(
+                    "Umbrel electrs reachable but wrong network — expected {}, verify Electrs matches Bitcoin Core",
+                    network.data_dir_name()
+                );
+            }
+            HostProbeFailure::TcpRefused => {
+                tracing::warn!(
+                    "Umbrel electrs unreachable (TCP refused on ports {:?}) — ensure Electrs container is running and APP_ELECTRS_NODE_IP is correct",
+                    ports
+                );
+            }
         }
     }
     None
@@ -632,7 +908,7 @@ pub fn resolve_working_indexer_url(raw: &str, network: &NetworkType) -> Option<S
         let bare = strip_indexer_scheme(trimmed);
         if let Some((host, port_str)) = bare.rsplit_once(':') {
             if let Ok(port) = port_str.parse::<u16>() {
-                return try_host(network, host.trim(), &[port]);
+                return try_host(network, host.trim(), &[port]).ok();
             }
         }
         return None;
@@ -640,7 +916,7 @@ pub fn resolve_working_indexer_url(raw: &str, network: &NetworkType) -> Option<S
 
     if let Some((host, port_str)) = trimmed.rsplit_once(':') {
         if let Ok(port) = port_str.parse::<u16>() {
-            return try_host(network, host.trim(), &[port]);
+            return try_host(network, host.trim(), &[port]).ok();
         }
     }
 
@@ -929,11 +1205,19 @@ mod tests {
     }
 
     #[test]
-    fn lan_subnets_from_lan_ip_env() {
+    fn sanitize_clears_mistaken_umbrel_lan_override() {
+        std::env::set_var("BROADCAST_POOL_UMBREL", "1");
         std::env::set_var("BROADCAST_POOL_LAN_IP", "192.168.50.26");
-        let cfg = crate::config::Config::default_config();
-        let subnets = lan_subnets_to_scan(&cfg);
-        assert!(subnets.contains(&"192.168.50".to_string()));
+        std::env::set_var("APP_ELECTRS_NODE_IP", "10.21.21.9");
+        let mut cfg = crate::config::Config::default_config();
+        cfg.indexer = Some(crate::config::IndexerConfig {
+            url: "tcp://192.168.50.26:50001".to_string(),
+            manual_override: true,
+        });
+        assert!(sanitize_umbrel_indexer_config(&mut cfg));
+        assert!(cfg.indexer.is_none());
+        std::env::remove_var("BROADCAST_POOL_UMBREL");
         std::env::remove_var("BROADCAST_POOL_LAN_IP");
+        std::env::remove_var("APP_ELECTRS_NODE_IP");
     }
 }

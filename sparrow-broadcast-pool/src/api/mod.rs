@@ -38,6 +38,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/estimate-fee", post(estimate_fee))
         .route("/api/test-indexer", post(test_indexer))
         .route("/api/discover-indexer", post(discover_indexer))
+        .route("/api/indexer-debug", get(get_indexer_debug))
         .route("/api/btc-price", get(get_btc_price))
         .with_state(state)
 }
@@ -385,6 +386,8 @@ struct StatusResponse {
     retain_by_default: bool,
     #[serde(alias = "sparrow_connect_url")]
     wallet_connect_url: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    indexer_status_hint: String,
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -420,7 +423,7 @@ async fn get_config(State(state): State<AppState>) -> Result<Json<ConfigResponse
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut reconnect = false;
     if crate::discovery::is_umbrel_mode() {
-        if crate::discovery::heal_umbrel_indexer_config(&mut config) {
+        if crate::discovery::sanitize_umbrel_indexer_config(&mut config) {
             reconnect = true;
             let _ = crate::discovery::save_config_to_disk(&config);
         }
@@ -576,7 +579,7 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
     let config = state.config.clone();
     let mut reconnect = false;
     if let Ok(mut cfg) = state.config.lock() {
-        if crate::discovery::heal_umbrel_indexer_config(&mut cfg) {
+        if crate::discovery::sanitize_umbrel_indexer_config(&mut cfg) {
             let _ = crate::discovery::save_config_to_disk(&cfg);
             reconnect = true;
         }
@@ -652,6 +655,11 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         wallet_url,
     ) = result.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    let indexer_status_hint = {
+        let cfg = state.config.lock().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        crate::discovery::umbrel_indexer_status_hint(&cfg, electrum_connected)
+    };
+
     Ok(Json(StatusResponse {
         network,
         network_display,
@@ -663,6 +671,7 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         pool_stats,
         retain_by_default: true,
         wallet_connect_url: wallet_url,
+        indexer_status_hint,
     }))
 }
 
@@ -839,10 +848,14 @@ async fn discover_indexer(
 
     let result = tokio::task::spawn_blocking(move || -> Result<DiscoverIndexerResponse, String> {
         let mut cfg = config.lock().map_err(|e| e.to_string())?;
-        if let Some(ref mut idx) = cfg.indexer {
-            idx.manual_override = false;
-        }
-        let found = crate::discovery::apply_indexer_discovery(&mut cfg);
+        let found = if crate::discovery::is_umbrel_mode() {
+            crate::discovery::discover_umbrel_if_needed(&mut cfg, true)
+        } else {
+            if let Some(ref mut idx) = cfg.indexer {
+                idx.manual_override = false;
+            }
+            crate::discovery::apply_indexer_discovery(&mut cfg)
+        };
         crate::discovery::save_config_to_disk(&cfg).map_err(|e| e.to_string())?;
 
         let url = cfg
@@ -851,6 +864,15 @@ async fn discover_indexer(
             .map(|i| i.url.clone())
             .unwrap_or_default();
         let network_type = cfg.network.network_type.clone();
+        let fail_hint = if !found {
+            if crate::discovery::is_umbrel_mode() {
+                crate::discovery::umbrel_indexer_status_hint(&cfg, false)
+            } else {
+                "Could not find Electrs/Fulcrum on the LAN".to_string()
+            }
+        } else {
+            String::new()
+        };
         drop(cfg);
 
         if found && !url.is_empty() {
@@ -886,7 +908,7 @@ async fn discover_indexer(
                     crate::discovery::display_indexer_url(&url)
                 )
             } else {
-                "Could not find Electrs/Fulcrum on the LAN".to_string()
+                fail_hint
             },
         })
     })
@@ -895,6 +917,22 @@ async fn discover_indexer(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(result))
+}
+
+async fn get_indexer_debug(
+    State(state): State<AppState>,
+) -> Result<Json<crate::discovery::UmbrelIndexerDiagnostics>, (StatusCode, String)> {
+    let pool_manager = state.pool_manager.clone();
+    let config = state.config.clone();
+    let diagnostics = tokio::task::spawn_blocking(move || {
+        let connected = pool_manager.indexer_healthy();
+        let cfg = config.lock().map_err(|e| e.to_string())?;
+        Ok(crate::discovery::umbrel_indexer_diagnostics(&cfg, connected))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task failed: {}", e)))?
+    .map_err(|e: String| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(diagnostics))
 }
 
 async fn restart_daemon() -> impl IntoResponse {

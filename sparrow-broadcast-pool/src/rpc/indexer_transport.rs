@@ -113,12 +113,26 @@ impl Write for TransportStream {
     }
 }
 
+fn connect_timeout_secs() -> u64 {
+    if std::env::var("BROADCAST_POOL_UMBREL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        || std::env::var("APP_ELECTRS_NODE_IP")
+            .map(|v| !v.trim().is_empty() && !v.contains("${"))
+            .unwrap_or(false)
+    {
+        2
+    } else {
+        5
+    }
+}
+
 fn connect_stream(url: &str) -> Result<TransportStream> {
     let use_ssl = url.starts_with("ssl://");
     let addr = strip_scheme(url);
     let tcp = TcpStream::connect_timeout(
         &addr.parse().context("Invalid indexer address")?,
-        Duration::from_secs(5),
+        Duration::from_secs(connect_timeout_secs()),
     )
     .with_context(|| format!("TCP connect failed ({})", addr))?;
     tcp.set_read_timeout(Some(Duration::from_secs(15)))?;
@@ -191,10 +205,16 @@ pub fn json_rpc(
         .context("Missing result in indexer response")
 }
 
+/// Electrum `server.version` requires `[client_name, protocol_version]`.
+fn server_version_probe_params() -> serde_json::Value {
+    serde_json::json!(["broadcast-pool", "1.4"])
+}
+
 /// First URL from candidates that responds to `server.version`.
 pub fn probe_working_url(candidates: &[String]) -> Option<String> {
+    let params = server_version_probe_params();
     for url in candidates {
-        if json_rpc(url, "server.version", serde_json::json!([])).is_ok() {
+        if json_rpc(url, "server.version", params.clone()).is_ok() {
             return Some(url.clone());
         }
     }
