@@ -509,37 +509,143 @@ const LOCAL_ELECTRUM_METHODS: &[&str] = &[
     "server.version",
     "server.banner",
     "server.ping",
-    "server.features",
 ];
 
-/// Answer Sparrow handshake locally (single JSON-RPC object or batch array).
-fn try_local_electrum_line(line: &str, config: &Mutex<Config>) -> Option<Vec<u8>> {
-    let v = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
-    let requests: Vec<JsonRpcRequest> = if let Some(arr) = v.as_array() {
-        let mut reqs = Vec::with_capacity(arr.len());
-        for item in arr {
-            let req: JsonRpcRequest = serde_json::from_value(item.clone()).ok()?;
-            if !LOCAL_ELECTRUM_METHODS.contains(&req.method.as_str()) {
-                return None;
-            }
-            reqs.push(req);
-        }
-        reqs
+fn parse_subrequests(line: &str) -> Result<Vec<JsonRpcRequest>> {
+    let v = serde_json::from_str::<serde_json::Value>(line.trim()).context("invalid JSON")?;
+    if let Some(arr) = v.as_array() {
+        arr.iter()
+            .map(|item| serde_json::from_value(item.clone()).context("invalid batch item"))
+            .collect()
     } else {
-        let req: JsonRpcRequest = serde_json::from_value(v).ok()?;
-        if !LOCAL_ELECTRUM_METHODS.contains(&req.method.as_str()) {
-            return None;
-        }
-        vec![req]
-    };
-
-    let mut out = Vec::new();
-    for req in requests {
-        let response = local_electrum_response(&req, config)?;
-        out.extend_from_slice(&serde_json::to_vec(&response).ok()?);
-        out.push(b'\n');
+        Ok(vec![serde_json::from_value(v).context("invalid request")?])
     }
-    Some(out)
+}
+
+fn line_is_batch(line: &str) -> bool {
+    line.trim_start().starts_with('[')
+}
+
+async fn forward_subrequest_sync(
+    request: &JsonRpcRequest,
+    indexer_url: &str,
+    session: &mut SessionState,
+    pool_manager: &PoolManager,
+) -> Result<serde_json::Value> {
+    session.track_request(request);
+    let raw = serde_json::to_string(request)?;
+    let url = indexer_url.to_string();
+    let id = request.id.clone();
+    let response_str = tokio::task::spawn_blocking(move || forward_to_indexer_sync(&raw, &url))
+        .await
+        .context("sync forward task failed")?;
+    let Some(resp_str) = response_str else {
+        return Ok(serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32000, "message": "Indexer temporarily unavailable" },
+            "id": id
+        }));
+    };
+    let mut msg: serde_json::Value = serde_json::from_str(resp_str.trim())?;
+    if let Some((method, scripthash)) = session.pending_methods.remove(&id) {
+        modify_upstream_response(&mut msg, &method, &scripthash, pool_manager, indexer_url);
+    }
+    Ok(msg)
+}
+
+async fn handle_one_subrequest(
+    request: &JsonRpcRequest,
+    pool_manager: &Arc<PoolManager>,
+    config: &Arc<Mutex<Config>>,
+    indexer_url: &str,
+    _indexer_stream: &mut Option<IndexerStream>,
+    session: &mut SessionState,
+    source_label: &str,
+    client_stream: &mut tokio::net::TcpStream,
+) -> Result<serde_json::Value> {
+    if LOCAL_ELECTRUM_METHODS.contains(&request.method.as_str()) {
+        return local_electrum_response(request, config).ok_or_else(|| {
+            anyhow::anyhow!("no local response for {}", request.method)
+        });
+    }
+
+    if request.method == "server.features" && !indexer_url.is_empty() {
+        return forward_subrequest_sync(request, indexer_url, session, pool_manager).await;
+    }
+
+    if request.method == "blockchain.transaction.get" {
+        if let Some(params) = request.params.as_ref().and_then(|p| p.as_array()) {
+            if let Some(txid) = params.get(0).and_then(|v| v.as_str()) {
+                let verbose = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+                if !verbose {
+                    if let Some(hex) = pool_manager.lookup_tx_hex(txid) {
+                        return Ok(serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "result": hex,
+                            "id": request.id
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    if request.method == "blockchain.transaction.broadcast" {
+        if let Some(ref params) = request.params {
+            if let Some(hex_param) = params_first_string(params) {
+                if let Err(e) = intercept_and_handle_broadcast(
+                    client_stream,
+                    request.id.clone(),
+                    hex_param,
+                    pool_manager,
+                    config,
+                    indexer_url,
+                    source_label,
+                    session,
+                )
+                .await
+                {
+                    tracing::error!("Broadcast handler error ({}): {}", source_label, e);
+                }
+                return Ok(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32603, "message": "Broadcast handled out-of-band" },
+                    "id": request.id
+                }));
+            }
+        }
+        return Ok(serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32602, "message": "Invalid params" },
+            "id": request.id
+        }));
+    }
+
+    if !indexer_url.is_empty() {
+        return forward_subrequest_sync(request, indexer_url, session, pool_manager).await;
+    }
+
+    Ok(serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": { "code": -32000, "message": "Indexer temporarily unavailable" },
+        "id": request.id
+    }))
+}
+
+async fn write_client_responses(
+    client_stream: &mut tokio::net::TcpStream,
+    responses: &[serde_json::Value],
+    batch: bool,
+) -> Result<()> {
+    let payload = if batch {
+        serde_json::to_vec(responses)?
+    } else {
+        serde_json::to_vec(&responses[0])?
+    };
+    client_stream.write_all(&payload).await?;
+    client_stream.write_all(b"\n").await?;
+    client_stream.flush().await?;
+    Ok(())
 }
 
 async fn write_json_rpc_response(
@@ -890,15 +996,6 @@ async fn handle_connection(
                                 continue;
                             }
 
-                            // Handshake first — including JSON-RPC batch arrays from Sparrow.
-                            if let Some(out) = try_local_electrum_line(&line_str, &config) {
-                                client_stream.write_all(&out).await?;
-                                client_stream.flush().await?;
-                                continue;
-                            }
-
-                            // Always intercept broadcast locally — never forward to upstream electrs
-                            // (real electrs rejects non-final txs and Sparrow would hang/error).
                             if let Some((id, hex_param)) = extract_broadcast_hex(&line_str) {
                                 if let Err(e) = intercept_and_handle_broadcast(
                                     &mut client_stream,
@@ -924,110 +1021,66 @@ async fn handle_connection(
                                     id,
                                     &line_str[..line_str.len().min(240)]
                                 );
-                                let response = serde_json::json!({
-                                    "jsonrpc": "2.0",
-                                    "error": { "code": -32602, "message": "Invalid broadcast params" },
-                                    "id": id
-                                });
-                                client_stream.write_all(&serde_json::to_vec(&response)?).await?;
-                                client_stream.write_all(b"\n").await?;
-                                client_stream.flush().await?;
+                                write_json_rpc_response(
+                                    &mut client_stream,
+                                    &serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "error": { "code": -32602, "message": "Invalid broadcast params" },
+                                        "id": id
+                                    }),
+                                )
+                                .await?;
                                 continue;
                             }
 
-                            if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&line_str) {
-
-                                // === Intercept blockchain.transaction.get for pending txs ===
-                                if request.method == "blockchain.transaction.get" {
-                                    if let Some(params) = request.params.as_ref().and_then(|p| p.as_array()) {
-                                        if let Some(txid) = params.get(0).and_then(|v| v.as_str()) {
-                                            let verbose = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
-                                            if !verbose {
-                                                if let Some(hex) = pool_manager.lookup_tx_hex(txid) {
-                                                    tracing::info!("Serving retained tx {} from pool", &txid[..txid.len().min(16)]);
-                                                    let response = serde_json::json!({
-                                                        "jsonrpc": "2.0",
-                                                        "result": hex,
-                                                        "id": request.id
-                                                    });
-                                                    client_stream.write_all(&serde_json::to_vec(&response)?).await?;
-                                                    client_stream.write_all(b"\n").await?;
-                                                    continue;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Fallback intercept (extract_broadcast_hex should have caught this)
-                                if request.method == "blockchain.transaction.broadcast" {
-                                    if let Some(ref params) = request.params {
-                                        if let Some(hex_param) = params_first_string(params) {
-                                            if let Err(e) = intercept_and_handle_broadcast(
-                                                &mut client_stream,
-                                                request.id.clone(),
-                                                hex_param,
-                                                &pool_manager,
-                                                &config,
-                                                &indexer_url,
-                                                source_label,
-                                                &session,
-                                            )
-                                            .await
-                                            {
-                                                tracing::error!("Broadcast handler error ({}): {}", source_label, e);
-                                            }
-                                            continue;
-                                        }
-                                    }
-                                    let response = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "error": { "code": -32602, "message": "Invalid params" },
-                                        "id": request.id
-                                    });
-                                    client_stream.write_all(&serde_json::to_vec(&response)?).await?;
-                                    client_stream.write_all(b"\n").await?;
-                                    client_stream.flush().await?;
+                            let batch = line_is_batch(&line_str);
+                            let subrequests = match parse_subrequests(&line_str) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    tracing::warn!("Invalid client JSON from {}: {}", peer_addr, e);
                                     continue;
                                 }
+                            };
+                            tracing::info!(
+                                "Electrum RPC from {}: [{}]",
+                                peer_addr,
+                                subrequests
+                                    .iter()
+                                    .map(|r| r.method.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            );
 
-                                // Track requests that need response modification
-                                session.track_request(&request);
-
-                                // === Everything else: forward to indexer when connected ===
+                            // Persistent upstream stream: forward whole line (batch or single).
+                            if indexer_stream.is_some() {
+                                for req in &subrequests {
+                                    session.track_request(req);
+                                }
                                 if let Some(ref mut idx) = indexer_stream {
                                     idx.write_all(&line_bytes).await?;
                                     idx.write_all(b"\n").await?;
-                                } else {
-                                    tracing::debug!(
-                                        "No indexer for {} — returning unavailable for id {:?}",
-                                        request.method,
-                                        request.id
-                                    );
-                                    let response = serde_json::json!({
-                                        "jsonrpc": "2.0",
-                                        "error": {
-                                            "code": -32000,
-                                            "message": "Indexer temporarily unavailable"
-                                        },
-                                        "id": request.id
-                                    });
-                                    write_json_rpc_response(&mut client_stream, &response).await?;
                                 }
-                            } else if line_looks_like_broadcast(&line_str) {
-                                tracing::error!(
-                                    "Broadcast-shaped line reached forward path — refusing to proxy to indexer"
-                                );
-                            } else if let Some(ref mut idx) = indexer_stream {
-                                idx.write_all(&line_bytes).await?;
-                                idx.write_all(b"\n").await?;
-                            } else {
-                                tracing::debug!(
-                                    "Waiting for indexer or unparsed line ({} bytes): {}",
-                                    line_str.len(),
-                                    &line_str[..line_str.len().min(80)]
+                                continue;
+                            }
+
+                            // No upstream stream yet — answer each subrequest (batch → JSON array).
+                            let mut responses = Vec::with_capacity(subrequests.len());
+                            for req in &subrequests {
+                                responses.push(
+                                    handle_one_subrequest(
+                                        req,
+                                        &pool_manager,
+                                        &config,
+                                        &indexer_url,
+                                        &mut indexer_stream,
+                                        &mut session,
+                                        source_label,
+                                        &mut client_stream,
+                                    )
+                                    .await?,
                                 );
                             }
+                            write_client_responses(&mut client_stream, &responses, batch).await?;
                         }
                     }
                     Err(e) => {
