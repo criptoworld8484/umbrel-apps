@@ -505,6 +505,43 @@ fn local_electrum_response(
     }
 }
 
+const LOCAL_ELECTRUM_METHODS: &[&str] = &[
+    "server.version",
+    "server.banner",
+    "server.ping",
+    "server.features",
+];
+
+/// Answer Sparrow handshake locally (single JSON-RPC object or batch array).
+fn try_local_electrum_line(line: &str, config: &Mutex<Config>) -> Option<Vec<u8>> {
+    let v = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+    let requests: Vec<JsonRpcRequest> = if let Some(arr) = v.as_array() {
+        let mut reqs = Vec::with_capacity(arr.len());
+        for item in arr {
+            let req: JsonRpcRequest = serde_json::from_value(item.clone()).ok()?;
+            if !LOCAL_ELECTRUM_METHODS.contains(&req.method.as_str()) {
+                return None;
+            }
+            reqs.push(req);
+        }
+        reqs
+    } else {
+        let req: JsonRpcRequest = serde_json::from_value(v).ok()?;
+        if !LOCAL_ELECTRUM_METHODS.contains(&req.method.as_str()) {
+            return None;
+        }
+        vec![req]
+    };
+
+    let mut out = Vec::new();
+    for req in requests {
+        let response = local_electrum_response(&req, config)?;
+        out.extend_from_slice(&serde_json::to_vec(&response).ok()?);
+        out.push(b'\n');
+    }
+    Some(out)
+}
+
 async fn write_json_rpc_response(
     client_stream: &mut tokio::net::TcpStream,
     response: &serde_json::Value,
@@ -815,38 +852,23 @@ async fn handle_connection(
     peer_addr: std::net::SocketAddr,
     source_label: &'static str,
 ) -> Result<()> {
-    let indexer_url = {
+    let indexer_url_opt = {
         let cfg = config.lock().map_err(|e| anyhow::anyhow!("Config lock: {}", e))?;
         cfg.indexer.as_ref().map(|idx| idx.url.clone())
     };
 
-    let mut indexer_stream = if let Some(ref url) = indexer_url {
-        match connect_indexer(url).await {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(
-                    "Indexer connect failed ({}): {} — wallet proxy continues (handshake + broadcast pool)",
-                    url,
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        tracing::warn!(
-            "No indexer configured — wallet proxy serves Electrum handshake and broadcast pool only"
-        );
-        None
-    };
-    let indexer_url = indexer_url.unwrap_or_default();
-    if indexer_stream.is_some() {
-        tracing::debug!("Proxy connection: {} <-> indexer {}", peer_addr, indexer_url);
-    } else {
-        tracing::info!(
-            "Electrum session for {} without upstream indexer (local handshake + pool)",
-            peer_addr
-        );
-    }
+    // Never block the wallet handshake waiting for upstream electrs.
+    let mut indexer_stream: Option<IndexerStream> = None;
+    let mut indexer_connect = indexer_url_opt.as_ref().map(|url| {
+        let url = url.clone();
+        tokio::spawn(async move { connect_indexer(&url).await })
+    });
+    let indexer_url = indexer_url_opt.unwrap_or_default();
+    tracing::info!(
+        "Electrum session started for {} [{}] (indexer connect in background)",
+        peer_addr,
+        source_label
+    );
 
     let mut client_buf = Vec::new();
     let mut indexer_buf = Vec::new();
@@ -868,10 +890,17 @@ async fn handle_connection(
                                 continue;
                             }
 
+                            // Handshake first — including JSON-RPC batch arrays from Sparrow.
+                            if let Some(out) = try_local_electrum_line(&line_str, &config) {
+                                client_stream.write_all(&out).await?;
+                                client_stream.flush().await?;
+                                continue;
+                            }
+
                             // Always intercept broadcast locally — never forward to upstream electrs
                             // (real electrs rejects non-final txs and Sparrow would hang/error).
                             if let Some((id, hex_param)) = extract_broadcast_hex(&line_str) {
-                                intercept_and_handle_broadcast(
+                                if let Err(e) = intercept_and_handle_broadcast(
                                     &mut client_stream,
                                     id,
                                     hex_param,
@@ -881,7 +910,10 @@ async fn handle_connection(
                                     source_label,
                                     &session,
                                 )
-                                .await?;
+                                .await
+                                {
+                                    tracing::error!("Broadcast handler error ({}): {}", source_label, e);
+                                }
                                 continue;
                             }
 
@@ -904,12 +936,6 @@ async fn handle_connection(
                             }
 
                             if let Ok(request) = serde_json::from_str::<JsonRpcRequest>(&line_str) {
-
-                                // Handshake locally — Sparrow must get these before anything else.
-                                if let Some(response) = local_electrum_response(&request, &config) {
-                                    write_json_rpc_response(&mut client_stream, &response).await?;
-                                    continue;
-                                }
 
                                 // === Intercept blockchain.transaction.get for pending txs ===
                                 if request.method == "blockchain.transaction.get" {
@@ -937,7 +963,7 @@ async fn handle_connection(
                                 if request.method == "blockchain.transaction.broadcast" {
                                     if let Some(ref params) = request.params {
                                         if let Some(hex_param) = params_first_string(params) {
-                                            intercept_and_handle_broadcast(
+                                            if let Err(e) = intercept_and_handle_broadcast(
                                                 &mut client_stream,
                                                 request.id.clone(),
                                                 hex_param,
@@ -947,7 +973,10 @@ async fn handle_connection(
                                                 source_label,
                                                 &session,
                                             )
-                                            .await?;
+                                            .await
+                                            {
+                                                tracing::error!("Broadcast handler error ({}): {}", source_label, e);
+                                            }
                                             continue;
                                         }
                                     }
@@ -994,8 +1023,9 @@ async fn handle_connection(
                                 idx.write_all(b"\n").await?;
                             } else {
                                 tracing::debug!(
-                                    "Dropped client line (no indexer, unparsed): {}",
-                                    &line_str[..line_str.len().min(120)]
+                                    "Waiting for indexer or unparsed line ({} bytes): {}",
+                                    line_str.len(),
+                                    &line_str[..line_str.len().min(80)]
                                 );
                             }
                         }
@@ -1003,6 +1033,31 @@ async fn handle_connection(
                     Err(e) => {
                         tracing::debug!("Client read error: {}", e);
                         break;
+                    }
+                }
+            }
+            result = async {
+                if let Some(handle) = indexer_connect.as_mut() {
+                    handle.await
+                } else {
+                    std::future::pending().await
+                }
+            }, if indexer_connect.is_some() && indexer_stream.is_none() => {
+                indexer_connect = None;
+                match result {
+                    Ok(Ok(s)) => {
+                        tracing::info!("Upstream indexer connected for {}", peer_addr);
+                        indexer_stream = Some(s);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            "Upstream indexer connect failed for {}: {}",
+                            peer_addr,
+                            e
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!("Indexer connect task failed for {}: {}", peer_addr, e);
                     }
                 }
             }
