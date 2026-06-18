@@ -542,7 +542,7 @@ fn local_electrum_response(
         "server.banner" => Some(serde_json::json!({
             "jsonrpc": "2.0",
             "result": format!(
-                "broadcast-pool {} — Disable Sparrow Tor proxy (Settings→Network) or broadcasts go to mempool.space, not this pool.",
+                "broadcast-pool {} - disable Sparrow Tor proxy so broadcasts reach this pool",
                 env!("CARGO_PKG_VERSION")
             ),
             "id": id
@@ -565,6 +565,7 @@ fn local_electrum_response(
                     "protocol_max": "1.4",
                     "protocol_min": "1.0",
                     "protocol_version": "1.4",
+                    "server_version": format!("broadcast-pool {}", env!("CARGO_PKG_VERSION")),
                     "hash_function": "sha256"
                 },
                 "id": id
@@ -693,11 +694,35 @@ async fn handle_one_subrequest(
         return Ok(resp);
     }
 
-    if is_broadcast_method(&request.method) {
-        anyhow::bail!(
-            "{} must be handled by intercept_and_handle_broadcast",
-            request.method
+    if request.method == "blockchain.headers.subscribe" {
+        let height = pool_manager
+            .check_block_height()
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        tracing::debug!(
+            "blockchain.headers.subscribe answered locally (height={})",
+            height
         );
+        return Ok(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "height": height,
+                "hex": "0".repeat(160)
+            },
+            "id": request.id
+        }));
+    }
+
+    if is_broadcast_method(&request.method) {
+        return Ok(serde_json::json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32603,
+                "message": format!("{} must use intercept path", request.method)
+            },
+            "id": request.id
+        }));
     }
 
     if request.method == "blockchain.transaction.get" {
@@ -1090,6 +1115,21 @@ async fn process_client_line(
         return Ok(());
     }
 
+    // Handshake RPCs: always answer locally (never block on upstream electrs).
+    if let Ok(handshake) = parse_subrequests(line_str) {
+        if handshake.len() == 1 && is_local_handshake_method(&handshake[0].method) {
+            if let Some(resp) = local_electrum_response(&handshake[0], config) {
+                write_client_responses(client_stream, &[resp], false).await?;
+                tracing::info!(
+                    "Electrum RPC from {}: [{}] (local handshake)",
+                    peer_addr,
+                    handshake[0].method
+                );
+                return Ok(());
+            }
+        }
+    }
+
     log_incoming_client_line(peer_addr, line_str, source_label);
 
     if line_str.len() > 280 {
@@ -1166,6 +1206,16 @@ async fn process_client_line(
                     &line_str[..line_str.len().min(200)]
                 );
             }
+            let id = line_json_rpc_id(line_str);
+            write_json_rpc_response(
+                client_stream,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32700, "message": "Parse error" },
+                    "id": id
+                }),
+            )
+            .await?;
             return Ok(());
         }
     };
@@ -1224,19 +1274,28 @@ async fn process_client_line(
     // Always answer each RPC immediately (Sparrow sends one method per line, not batches).
     let mut responses = Vec::with_capacity(subrequests.len());
     for req in &subrequests {
-        responses.push(
-            handle_one_subrequest(
-                req,
-                pool_manager,
-                config,
-                indexer_url,
-                indexer_stream,
-                session,
-                source_label,
-                client_stream,
-            )
-            .await?,
-        );
+        match handle_one_subrequest(
+            req,
+            pool_manager,
+            config,
+            indexer_url,
+            indexer_stream,
+            session,
+            source_label,
+            client_stream,
+        )
+        .await
+        {
+            Ok(resp) => responses.push(resp),
+            Err(e) => {
+                tracing::error!("RPC handler error for {}: {}", req.method, e);
+                responses.push(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32603, "message": e.to_string() },
+                    "id": req.id
+                }));
+            }
+        }
     }
     write_client_responses(client_stream, &responses, batch).await?;
     flush_deferred_indexer_out(session, client_stream).await?;
