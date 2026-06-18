@@ -30,15 +30,26 @@ SAMPLE_TX="0100000002f327e86da3e66bd20e1129b1fb36d07056f0b9a117199e759396526b8f3
 python3 -u <<PY
 import json, socket, sys
 sample_tx = """$SAMPLE_TX"""
+
+def read_line(sock):
+    buf = b""
+    while b"\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise RuntimeError("connection closed")
+        buf += chunk
+    line, _ = buf.split(b"\n", 1)
+    return line.decode()
+
 s = socket.create_connection(("127.0.0.1", 50050), timeout=3)
+s.settimeout(8)
 for name, req in [
     ("server.version", {"jsonrpc":"2.0","method":"server.version","params":["Sparrow Wallet","1.4"],"id":0}),
     ("blockchain.estimatefee", {"jsonrpc":"2.0","method":"blockchain.estimatefee","params":[6],"id":1}),
     ("blockchain.transaction.broadcast", {"jsonrpc":"2.0","method":"blockchain.transaction.broadcast","params":sample_tx,"id":2}),
 ]:
     s.sendall((json.dumps(req)+"\n").encode())
-    s.settimeout(8)
-    data = s.recv(65536)
+    data = read_line(s)
     print(name, "->", data[:140])
 s.close()
 PY

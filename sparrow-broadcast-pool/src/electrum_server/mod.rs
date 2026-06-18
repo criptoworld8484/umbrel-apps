@@ -406,6 +406,15 @@ impl SessionState {
     }
 }
 
+fn scripthash_from_params(params: &Option<serde_json::Value>) -> Option<String> {
+    params
+        .as_ref()
+        .and_then(|p| p.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
 fn fetch_scripthash_history_sync(scripthash: &str, indexer_url: &str) -> Vec<serde_json::Value> {
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -725,6 +734,63 @@ async fn handle_one_subrequest(
         }));
     }
 
+    // Sparrow polls get_history/get_mempool after broadcast — never block on electrs when pool has txs.
+    if request.method == "blockchain.scripthash.get_history"
+        || request.method == "blockchain.scripthash.get_mempool"
+    {
+        if let Some(sh) = scripthash_from_params(&request.params) {
+            let pending = pool_manager.get_pending_txids_for_scripthash(&sh);
+            if !pending.is_empty() {
+                tracing::info!(
+                    "Fast {} for {} ({} pool tx(s))",
+                    request.method,
+                    &sh[..sh.len().min(16)],
+                    pending.len()
+                );
+                let result = if request.method == "blockchain.scripthash.get_mempool" {
+                    pending::inject_get_mempool(serde_json::json!([0, []]), &pending)
+                } else {
+                    let history: Vec<serde_json::Value> = pending
+                        .iter()
+                        .map(|txid| {
+                            serde_json::json!({
+                                "tx_hash": txid,
+                                "height": 0
+                            })
+                        })
+                        .collect();
+                    serde_json::Value::Array(history)
+                };
+                return Ok(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "result": result,
+                    "id": request.id
+                }));
+            }
+        }
+    }
+
+    if request.method == "blockchain.scripthash.subscribe" {
+        if let Some(sh) = scripthash_from_params(&request.params) {
+            session.subscribed_scripthashes.insert(sh.clone());
+            let pending = pool_manager.get_pending_txids_for_scripthash(&sh);
+            if !pending.is_empty() {
+                if let Some(hash) = pending::compute_modified_status_hash(vec![], &sh, &pending) {
+                    tracing::info!(
+                        "Fast scripthash.subscribe for {} ({} pool tx(s))",
+                        &sh[..sh.len().min(16)],
+                        pending.len()
+                    );
+                    return Ok(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "result": hash,
+                        "id": request.id
+                    }));
+                }
+            }
+        }
+    }
+
     if request.method == "blockchain.transaction.get" {
         if let Some(params) = request.params.as_ref().and_then(|p| p.as_array()) {
             if let Some(txid) = params.get(0).and_then(|v| v.as_str()) {
@@ -792,68 +858,35 @@ fn quick_broadcast_preview(tx_hex: &str) -> Result<BroadcastPreview> {
     Ok(BroadcastPreview { txid })
 }
 
-async fn notify_subscriptions(
+async fn notify_subscribed_pending_mempool(
     client_stream: &mut tokio::net::TcpStream,
     subscribed: &HashSet<String>,
-    scripthashes: &[String],
-    pool_manager: Arc<PoolManager>,
-    indexer_url: String,
+    pool_manager: &PoolManager,
+    txid_hint: &str,
 ) -> Result<()> {
-    for sh in scripthashes {
-        if !subscribed.contains(sh) {
-            tracing::debug!(
-                "Skip post-broadcast notify for {} (not subscribed)",
-                &sh[..sh.len().min(16)]
-            );
-            continue;
-        }
+    for sh in subscribed {
         let pending = pool_manager.get_pending_txids_for_scripthash(sh);
-        if pending.is_empty() {
+        if pending.is_empty() || !pending.iter().any(|t| t == txid_hint) {
             continue;
         }
-        let pending_for_fallback = pending.clone();
-        let sh_clone = sh.clone();
-        let url = indexer_url.clone();
-        let new_hash = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || {
-                let real_history = fetch_scripthash_history_sync(&sh_clone, &url);
-                pending::compute_modified_status_hash(real_history, &sh_clone, &pending)
-            }),
-        )
-        .await;
-
-        let new_hash = match new_hash {
-            Ok(Ok(h)) => h,
-            Ok(Err(e)) => {
-                tracing::warn!("Subscription notify task failed for {}: {}", &sh[..sh.len().min(16)], e);
-                pending::compute_modified_status_hash(vec![], sh, &pending_for_fallback)
-            }
-            Err(_) => {
-                tracing::warn!(
-                    "Subscription notify timed out for {}, using pending-only hash",
-                    &sh[..sh.len().min(16)]
-                );
-                pending::compute_modified_status_hash(vec![], sh, &pending_for_fallback)
-            }
+        let Some(hash) = pending::compute_modified_status_hash(vec![], sh, &pending) else {
+            continue;
         };
-
-        if let Some(hash) = new_hash {
-            tracing::info!(
-                "Sending subscription notification for scripthash {}",
-                &sh[..sh.len().min(16)]
-            );
-            let notification = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "blockchain.scripthash.subscribe",
-                "params": [sh, hash]
-            });
-            client_stream
-                .write_all(&serde_json::to_vec(&notification)?)
-                .await?;
-            client_stream.write_all(b"\n").await?;
-            client_stream.flush().await?;
-        }
+        tracing::info!(
+            "Mempool notify for scripthash {} (txid={})",
+            &sh[..sh.len().min(16)],
+            &txid_hint[..txid_hint.len().min(16)]
+        );
+        let notification = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [sh, hash]
+        });
+        client_stream
+            .write_all(&serde_json::to_vec(&notification)?)
+            .await?;
+        client_stream.write_all(b"\n").await?;
+        client_stream.flush().await?;
     }
     Ok(())
 }
@@ -919,17 +952,7 @@ async fn intercept_and_handle_broadcast(
         }
     };
 
-    write_json_rpc_response(
-        client_stream,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "result": preview.txid,
-            "id": id
-        }),
-    )
-    .await?;
-    tracing::info!("Broadcast ack sent to wallet, txid={}", preview.txid);
-
+    // Ingest before ack: Sparrow polls get_history immediately after txid and expects height 0.
     let pm = pool_manager.clone();
     let cfg = config.clone();
     let url = indexer_url.to_string();
@@ -941,33 +964,65 @@ async fn intercept_and_handle_broadcast(
     })
     .await;
 
-    match ingest {
-        Ok(Ok(result)) => {
-            tracing::info!("Broadcast ingested into pool, txid={}", result.txid);
-            if result.retained {
-                if let Err(e) = notify_subscriptions(
-                    client_stream,
-                    &session.subscribed_scripthashes,
-                    &result.affected_scripthashes,
-                    pool_manager.clone(),
-                    indexer_url.to_string(),
-                )
-                .await
-                {
-                    tracing::warn!("Post-broadcast subscription notify failed: {}", e);
-                }
-            }
+    let result = match ingest {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            tracing::error!("Broadcast ingest failed for {}: {}", preview.txid, e);
+            write_json_rpc_response(
+                client_stream,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -25, "message": e.to_string() },
+                    "id": id
+                }),
+            )
+            .await?;
+            return Ok(());
         }
-        Ok(Err(e)) => tracing::error!(
-            "Broadcast ack sent but pool ingest failed for {}: {}",
-            preview.txid,
-            e
-        ),
-        Err(e) => tracing::error!(
-            "Broadcast ack sent but pool ingest task failed for {}: {}",
-            preview.txid,
-            e
-        ),
+        Err(e) => {
+            tracing::error!("Broadcast ingest task failed for {}: {}", preview.txid, e);
+            write_json_rpc_response(
+                client_stream,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -25, "message": e.to_string() },
+                    "id": id
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
+    tracing::info!("Broadcast ingested into pool, txid={}", result.txid);
+
+    write_json_rpc_response(
+        client_stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": result.txid,
+            "id": id
+        }),
+    )
+    .await?;
+    tracing::info!("Broadcast ack sent to wallet, txid={}", result.txid);
+
+    if result.retained {
+        if session.subscribed_scripthashes.is_empty() {
+            tracing::warn!(
+                "Broadcast ingested but no scripthash subscriptions on this session — Sparrow mempool poll relies on fast get_history"
+            );
+        }
+        if let Err(e) = notify_subscribed_pending_mempool(
+            client_stream,
+            &session.subscribed_scripthashes,
+            pool_manager,
+            &result.txid,
+        )
+        .await
+        {
+            tracing::warn!("Post-broadcast mempool notify failed: {}", e);
+        }
     }
     Ok(())
 }
