@@ -551,6 +551,10 @@ async fn forward_subrequest_sync(
     session: &mut SessionState,
     pool_manager: &PoolManager,
 ) -> Result<serde_json::Value> {
+    if request.method == "blockchain.transaction.broadcast" {
+        anyhow::bail!("broadcast must not be forwarded to upstream electrs");
+    }
+
     session.track_request(request);
     let raw = serde_json::to_string(request)?;
     let url = indexer_url.to_string();
@@ -588,6 +592,12 @@ async fn handle_one_subrequest(
         });
     }
 
+    if request.method == "blockchain.transaction.broadcast" {
+        anyhow::bail!(
+            "blockchain.transaction.broadcast must be handled by intercept_and_handle_broadcast"
+        );
+    }
+
     if request.method == "blockchain.transaction.get" {
         if let Some(params) = request.params.as_ref().and_then(|p| p.as_array()) {
             if let Some(txid) = params.get(0).and_then(|v| v.as_str()) {
@@ -603,37 +613,6 @@ async fn handle_one_subrequest(
                 }
             }
         }
-    }
-
-    if request.method == "blockchain.transaction.broadcast" {
-        if let Some(ref params) = request.params {
-            if let Some(hex_param) = params_first_string(params) {
-                if let Err(e) = intercept_and_handle_broadcast(
-                    client_stream,
-                    request.id.clone(),
-                    hex_param,
-                    pool_manager,
-                    config,
-                    indexer_url,
-                    source_label,
-                    session,
-                )
-                .await
-                {
-                    tracing::error!("Broadcast handler error ({}): {}", source_label, e);
-                }
-                return Ok(serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "error": { "code": -32603, "message": "Broadcast handled out-of-band" },
-                    "id": request.id
-                }));
-            }
-        }
-        return Ok(serde_json::json!({
-            "jsonrpc": "2.0",
-            "error": { "code": -32602, "message": "Invalid params" },
-            "id": request.id
-        }));
     }
 
     if !indexer_url.is_empty() {
@@ -1039,6 +1018,39 @@ async fn process_client_line(
             return Ok(());
         }
     };
+
+    // Broadcast: always intercept locally (never proxy to electrs — non-final txs hang/reject).
+    if subrequests.len() == 1 && subrequests[0].method == "blockchain.transaction.broadcast" {
+        let req = &subrequests[0];
+        if let Some(hex_param) = req.params.as_ref().and_then(params_first_string) {
+            if let Err(e) = intercept_and_handle_broadcast(
+                client_stream,
+                req.id.clone(),
+                hex_param,
+                pool_manager,
+                config,
+                indexer_url,
+                source_label,
+                session,
+            )
+            .await
+            {
+                tracing::error!("Broadcast handler error ({}): {}", source_label, e);
+            }
+        } else {
+            write_json_rpc_response(
+                client_stream,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32602, "message": "Invalid broadcast params" },
+                    "id": req.id.clone()
+                }),
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
     tracing::info!(
         "Electrum RPC from {}: [{}]",
         peer_addr,
@@ -1616,16 +1628,14 @@ fn handle_broadcast(
         tx_hex: &str,
         indexer_url: &str,
     ) -> Result<Vec<String>> {
-        let url = if indexer_url.is_empty() {
-            pool_manager
-                .get_indexer_url()
-                .context("No indexer configured")?
-        } else {
-            indexer_url.to_string()
-        };
-        let indexer_addr = pending::strip_indexer_host(&url);
-        let scripthashes = pending::extract_affected_scripthashes_opts(tx_hex, &indexer_addr, true)?;
-        let outputs: Vec<PendingTxOutput> = pending::extract_outputs(tx_hex)?
+        // fast=true only needs output scripthashes from the tx hex (no indexer RPC).
+        let scripthashes = pending::extract_affected_scripthashes_opts(tx_hex, "", true)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Could not derive scripthashes for {}: {}", txid, e);
+                Vec::new()
+            });
+        let outputs: Vec<PendingTxOutput> = pending::extract_outputs(tx_hex)
+            .unwrap_or_default()
             .into_iter()
             .map(|(output_index, value, scripthash)| PendingTxOutput {
                 output_index,
@@ -1634,6 +1644,9 @@ fn handle_broadcast(
             })
             .collect();
         pool_manager.store_pending_tx(txid, tx_hex, scripthashes.clone(), outputs);
+        if indexer_url.is_empty() && scripthashes.is_empty() {
+            tracing::debug!("Stored {} without scripthashes (indexer not required for ingest)", txid);
+        }
         Ok(scripthashes)
     }
 

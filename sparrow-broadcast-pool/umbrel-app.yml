@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.2.16"
+version: "0.2.17"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,13 +31,15 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.2.16 — Fix Sparrow Connecting when RPCs are sent one-by-one (not batch).
+  v0.2.17 — Fix Sparrow stuck on "broadcasting" for block-height scheduled txs.
 
-  - Answer every Electrum RPC immediately via sync forward (no silent persistent proxy)
+  - Intercept blockchain.transaction.broadcast locally before any electrs proxy
 
-  - Skip slow scripthash history fetch when the pool has no pending txs for that address
+  - Single txid ack (no duplicate error response that confused Sparrow)
 
-  - Matches Sparrow connect sequence: version, features, headers.subscribe, scripthash.subscribe...
+  - Never forward non-final txs to electrs (they hang indefinitely)
+
+  - Ingest without blocking on indexer RPC for virtual mempool storage
 developer: criptoworld8484
 website: https://github.com/criptoworld8484/umbrel-apps
 repo: https://github.com/criptoworld8484/umbrel-apps/tree/master/sparrow-broadcast-pool
