@@ -202,12 +202,60 @@ struct JsonRpcRequest {
     id: serde_json::Value,
 }
 
-/// Parse `blockchain.transaction.broadcast` even when strict struct decode would fail.
-/// Supports single requests, batch arrays, and params as `[hex]` or `"hex"`.
+const BROADCAST_METHODS: &[&str] = &[
+    "blockchain.transaction.broadcast",
+    "blockchain.transaction.broadcast_package",
+];
+
+fn is_broadcast_method(method: &str) -> bool {
+    BROADCAST_METHODS.contains(&method)
+}
+
+fn line_mentions_tx_rpc(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("broadcast") || lower.contains("transaction")
+}
+
+fn log_incoming_client_line(peer_addr: std::net::SocketAddr, line_str: &str, source_label: &str) {
+    if line_mentions_tx_rpc(line_str) {
+        tracing::info!(
+            "Electrum incoming [{}] from {} (len={}, preview={})",
+            source_label,
+            peer_addr,
+            line_str.len(),
+            &line_str[..line_str.len().min(200)]
+        );
+    }
+}
+
+fn peek_line_methods(line: &str) -> Option<Vec<String>> {
+    let v = serde_json::from_str::<serde_json::Value>(line.trim()).ok()?;
+    if let Some(arr) = v.as_array() {
+        return Some(
+            arr.iter()
+                .filter_map(|item| item.get("method")?.as_str().map(str::to_string))
+                .collect(),
+        );
+    }
+    v.get("method")
+        .and_then(|m| m.as_str())
+        .map(|m| vec![m.to_string()])
+}
+
+/// Parse broadcast RPC even when strict struct decode would fail.
+/// Supports `[hex]`, `"hex"`, object params, and broadcast_package batches.
 fn params_first_string(params: &serde_json::Value) -> Option<String> {
     match params {
         serde_json::Value::Array(arr) => arr.first()?.as_str().map(|s| s.to_string()),
         serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(map) => {
+            for key in ["raw_tx", "tx", "transaction", "hex"] {
+                if let Some(serde_json::Value::String(s)) = map.get(key) {
+                    return Some(s.clone());
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -217,11 +265,18 @@ fn json_rpc_id(v: &serde_json::Value) -> serde_json::Value {
 }
 
 fn extract_broadcast_from_value(v: &serde_json::Value) -> Option<(serde_json::Value, String)> {
-    if v.get("method")?.as_str()? != "blockchain.transaction.broadcast" {
+    let method = v.get("method")?.as_str()?;
+    if !is_broadcast_method(method) {
         return None;
     }
     let id = json_rpc_id(v);
-    let hex = params_first_string(v.get("params")?)?;
+    let params = v.get("params")?;
+    if method == "blockchain.transaction.broadcast_package" {
+        let tx_arr = params.as_array()?.first()?.as_array()?;
+        let hex = tx_arr.first()?.as_str()?;
+        return Some((id, hex.to_string()));
+    }
+    let hex = params_first_string(params)?;
     Some((id, hex))
 }
 
@@ -239,7 +294,7 @@ fn extract_broadcast_hex(line: &str) -> Option<(serde_json::Value, String)> {
 }
 
 fn line_looks_like_broadcast(line: &str) -> bool {
-    line.contains("blockchain.transaction.broadcast")
+    BROADCAST_METHODS.iter().any(|m| line.contains(m))
 }
 
 fn line_json_rpc_id(line: &str) -> serde_json::Value {
@@ -248,7 +303,10 @@ fn line_json_rpc_id(line: &str) -> serde_json::Value {
     };
     if let Some(arr) = v.as_array() {
         for item in arr {
-            if item.get("method").and_then(|m| m.as_str()) == Some("blockchain.transaction.broadcast")
+            if item
+                .get("method")
+                .and_then(|m| m.as_str())
+                .is_some_and(is_broadcast_method)
             {
                 return json_rpc_id(item);
             }
@@ -524,6 +582,42 @@ fn is_local_handshake_method(method: &str) -> bool {
     LOCAL_ELECTRUM_METHODS.contains(&method)
 }
 
+fn local_fast_response(request: &JsonRpcRequest) -> Option<serde_json::Value> {
+    let id = request.id.clone();
+    match request.method.as_str() {
+        // Sparrow polls these via electrum before/during broadcast; never block on upstream.
+        "blockchain.estimatefee" => Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": 0.00001,
+            "id": id
+        })),
+        "blockchain.relayfee" => Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": 0.00001,
+            "id": id
+        })),
+        "mempool.get_fee_histogram" => Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": [],
+            "id": id
+        })),
+        "blockchain.block.stats" => Some(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "height": request.params.as_ref()
+                    .and_then(|p| p.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                "time": 0,
+                "median_fee": 0.00001
+            },
+            "id": id
+        })),
+        _ => None,
+    }
+}
+
 fn batch_contains_local_handshake(subrequests: &[JsonRpcRequest]) -> bool {
     subrequests
         .iter()
@@ -551,7 +645,7 @@ async fn forward_subrequest_sync(
     session: &mut SessionState,
     pool_manager: &PoolManager,
 ) -> Result<serde_json::Value> {
-    if request.method == "blockchain.transaction.broadcast" {
+    if is_broadcast_method(&request.method) {
         anyhow::bail!("broadcast must not be forwarded to upstream electrs");
     }
 
@@ -592,9 +686,14 @@ async fn handle_one_subrequest(
         });
     }
 
-    if request.method == "blockchain.transaction.broadcast" {
+    if let Some(resp) = local_fast_response(request) {
+        return Ok(resp);
+    }
+
+    if is_broadcast_method(&request.method) {
         anyhow::bail!(
-            "blockchain.transaction.broadcast must be handled by intercept_and_handle_broadcast"
+            "{} must be handled by intercept_and_handle_broadcast",
+            request.method
         );
     }
 
@@ -730,10 +829,7 @@ async fn intercept_and_handle_broadcast(
     source_label: &str,
     session: &SessionState,
 ) -> Result<()> {
-    tracing::info!(
-        "INTERCEPTED blockchain.transaction.broadcast (hex len={})",
-        hex_param.len()
-    );
+    tracing::info!("INTERCEPTED broadcast RPC (hex len={})", hex_param.len());
 
     let hex_quick = hex_param.clone();
     let preview = match tokio::time::timeout(
@@ -973,6 +1069,17 @@ async fn process_client_line(
         return Ok(());
     }
 
+    log_incoming_client_line(peer_addr, line_str, source_label);
+    if line_mentions_tx_rpc(line_str) {
+        if let Some(methods) = peek_line_methods(line_str) {
+            tracing::info!(
+                "Electrum tx/broadcast methods from {}: [{}]",
+                peer_addr,
+                methods.join(", ")
+            );
+        }
+    }
+
     if let Some((id, hex_param)) = extract_broadcast_hex(line_str) {
         if let Err(e) = intercept_and_handle_broadcast(
             client_stream,
@@ -1014,18 +1121,37 @@ async fn process_client_line(
     let subrequests = match parse_subrequests(line_str) {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!("Invalid client JSON from {}: {}", peer_addr, e);
+            tracing::warn!(
+                "Invalid client JSON from {} (len={}): {}",
+                peer_addr,
+                line_str.len(),
+                e
+            );
+            if line_mentions_tx_rpc(line_str) {
+                tracing::error!(
+                    "Invalid JSON on tx/broadcast line from {}: {}",
+                    peer_addr,
+                    &line_str[..line_str.len().min(200)]
+                );
+            }
             return Ok(());
         }
     };
 
     // Broadcast: always intercept locally (never proxy to electrs — non-final txs hang/reject).
-    if subrequests.len() == 1 && subrequests[0].method == "blockchain.transaction.broadcast" {
-        let req = &subrequests[0];
-        if let Some(hex_param) = req.params.as_ref().and_then(params_first_string) {
+    if subrequests.iter().any(|r| is_broadcast_method(&r.method)) {
+        let broadcast_req = subrequests
+            .iter()
+            .find(|r| is_broadcast_method(&r.method))
+            .expect("checked any");
+        if let Some(hex_param) = broadcast_req
+            .params
+            .as_ref()
+            .and_then(params_first_string)
+        {
             if let Err(e) = intercept_and_handle_broadcast(
                 client_stream,
-                req.id.clone(),
+                broadcast_req.id.clone(),
                 hex_param,
                 pool_manager,
                 config,
@@ -1043,7 +1169,7 @@ async fn process_client_line(
                 &serde_json::json!({
                     "jsonrpc": "2.0",
                     "error": { "code": -32602, "message": "Invalid broadcast params" },
-                    "id": req.id.clone()
+                    "id": broadcast_req.id.clone()
                 }),
             )
             .await?;
@@ -1115,7 +1241,9 @@ async fn handle_connection(
         while let Some(newline_pos) = client_buf.iter().position(|&b| b == b'\n') {
             let line_bytes = client_buf[..newline_pos].to_vec();
             client_buf.drain(..=newline_pos);
-            let line_str = String::from_utf8_lossy(&line_bytes).to_string();
+            let line_str = String::from_utf8_lossy(&line_bytes)
+                .trim_end_matches('\r')
+                .to_string();
 
             process_client_line(
                 &line_bytes,
@@ -1130,6 +1258,19 @@ async fn handle_connection(
                 &mut client_stream,
             )
             .await?;
+        }
+
+        if !client_buf.is_empty() && client_buf.len() >= 4096 {
+            let preview = String::from_utf8_lossy(&client_buf[..client_buf.len().min(120)]);
+            if line_mentions_tx_rpc(&preview) || preview.contains("method") {
+                tracing::warn!(
+                    "Electrum client {} [{}] buffered {} bytes without newline (preview={})",
+                    peer_addr,
+                    source_label,
+                    client_buf.len(),
+                    preview
+                );
+            }
         }
     }
 
@@ -1671,4 +1812,108 @@ fn handle_broadcast(
         retained: true,
         affected_scripthashes: scripthashes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_TX: &str = "0100000002f327e86da3e66bd20e1129b1fb36d07056f0b9a117199e759396526b8f3a20780000000000fffffffff0ede03d75050f20801d50358829ae02c058e8677d2cc74df51f738285013c260000000000ffffffff02f028d6dc010000001976a914ffb035781c3c69e076d48b60c3d38592e7ce06a788ac00ca9a3b000000001976a914fa5139067622fd7e1e722a05c17c2bb7d5fd6df088ac00000000";
+
+    #[test]
+    fn extract_broadcast_hex_array_params() {
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","method":"blockchain.transaction.broadcast","params":["{}"],"id":42}}"#,
+            SAMPLE_TX
+        );
+        let (id, hex) = extract_broadcast_hex(&line).expect("array params");
+        assert_eq!(id, serde_json::json!(42));
+        assert_eq!(hex, SAMPLE_TX);
+    }
+
+    #[test]
+    fn extract_broadcast_hex_string_params() {
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","method":"blockchain.transaction.broadcast","params":"{}","id":7}}"#,
+            SAMPLE_TX
+        );
+        let (id, hex) = extract_broadcast_hex(&line).expect("string params");
+        assert_eq!(id, serde_json::json!(7));
+        assert_eq!(hex, SAMPLE_TX);
+    }
+
+    #[test]
+    fn extract_broadcast_hex_sparrow_single_param() {
+        // Sparrow SimpleElectrumServerRpc uses .params(txHex) — often serializes as bare string.
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","method":"blockchain.transaction.broadcast","params":"{}","id":99}}"#,
+            SAMPLE_TX
+        );
+        assert!(line_looks_like_broadcast(&line));
+        assert!(extract_broadcast_hex(&line).is_some());
+    }
+
+    #[test]
+    fn extract_broadcast_package_first_tx() {
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","method":"blockchain.transaction.broadcast_package","params":[["{}","02000000ffffffff0100"]],"id":3}}"#,
+            SAMPLE_TX
+        );
+        let (_, hex) = extract_broadcast_hex(&line).expect("package");
+        assert_eq!(hex, SAMPLE_TX);
+    }
+
+    #[test]
+    fn resolve_ingest_timestamp_locktime_is_scheduled() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [network]
+            type = "signet"
+            [pool]
+            max_size_kb = 300
+            rebroadcast_interval_minutes = 30
+            expiry_days = 14
+            [privacy]
+            use_tor = false
+            tor_socks_port = 9050
+            rotate_identity_per_tx = false
+            "#,
+        )
+        .expect("test config");
+        let (mode, _) = resolve_ingest_plan("sparrow", 1_750_000_000, &cfg);
+        assert_eq!(mode, BroadcastMode::Scheduled);
+    }
+
+    #[test]
+    fn resolve_ingest_block_height_locktime_is_by_block() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [network]
+            type = "signet"
+            [pool]
+            max_size_kb = 300
+            rebroadcast_interval_minutes = 30
+            expiry_days = 14
+            [privacy]
+            use_tor = false
+            tor_socks_port = 9050
+            rotate_identity_per_tx = false
+            "#,
+        )
+        .expect("test config");
+        let (mode, _) = resolve_ingest_plan("sparrow", 900_000, &cfg);
+        assert_eq!(mode, BroadcastMode::ByBlock);
+    }
+
+    #[test]
+    fn local_fast_response_estimatefee() {
+        let req = JsonRpcRequest {
+            jsonrpc: Some("2.0".into()),
+            method: "blockchain.estimatefee".into(),
+            params: Some(serde_json::json!([6])),
+            id: serde_json::json!(1),
+        };
+        let resp = local_fast_response(&req).expect("estimatefee");
+        assert!(resp.get("result").is_some());
+    }
 }
