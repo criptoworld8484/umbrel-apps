@@ -380,8 +380,11 @@ fn modify_upstream_response(
             }
         }
         "blockchain.scripthash.subscribe" => {
-            let real_history = fetch_scripthash_history_sync(scripthash, indexer_url);
             let pending = pool_manager.get_pending_txids_for_scripthash(scripthash);
+            if pending.is_empty() {
+                return;
+            }
+            let real_history = fetch_scripthash_history_sync(scripthash, indexer_url);
             if let Some(hash) =
                 pending::compute_modified_status_hash(real_history, scripthash, &pending)
             {
@@ -1048,43 +1051,24 @@ async fn process_client_line(
 
     session.client_busy = true;
 
-    // Handshake + mixed batches: answer locally / sync-forward per subrequest (never proxy whole batch).
-    if batch_contains_local_handshake(&subrequests) || indexer_stream.is_none() {
-        let mut responses = Vec::with_capacity(subrequests.len());
-        for req in &subrequests {
-            responses.push(
-                handle_one_subrequest(
-                    req,
-                    pool_manager,
-                    config,
-                    indexer_url,
-                    indexer_stream,
-                    session,
-                    source_label,
-                    client_stream,
-                )
-                .await?,
-            );
-        }
-        write_client_responses(client_stream, &responses, batch).await?;
-        flush_deferred_indexer_out(session, client_stream).await?;
-        tracing::debug!(
-            "Handshake/client batch answered for {} ({} subrequests)",
-            peer_addr,
-            subrequests.len()
-        );
-        return Ok(());
-    }
-
-    // Persistent upstream stream for non-handshake traffic after connect.
+    // Always answer each RPC immediately (Sparrow sends one method per line, not batches).
+    let mut responses = Vec::with_capacity(subrequests.len());
     for req in &subrequests {
-        session.track_request(req);
+        responses.push(
+            handle_one_subrequest(
+                req,
+                pool_manager,
+                config,
+                indexer_url,
+                indexer_stream,
+                session,
+                source_label,
+                client_stream,
+            )
+            .await?,
+        );
     }
-    if let Some(ref mut idx) = indexer_stream {
-        idx.write_all(line_bytes).await?;
-        idx.write_all(b"\n").await?;
-        idx.flush().await?;
-    }
+    write_client_responses(client_stream, &responses, batch).await?;
     flush_deferred_indexer_out(session, client_stream).await?;
     Ok(())
 }
@@ -1096,129 +1080,44 @@ async fn handle_connection(
     peer_addr: std::net::SocketAddr,
     source_label: &'static str,
 ) -> Result<()> {
-    let indexer_url_opt = {
+    let indexer_url = {
         let cfg = config.lock().map_err(|e| anyhow::anyhow!("Config lock: {}", e))?;
-        cfg.indexer.as_ref().map(|idx| idx.url.clone())
+        cfg.indexer.as_ref().map(|idx| idx.url.clone()).unwrap_or_default()
     };
-
-    // Delay upstream electrs until after the first client RPC line (Sparrow handshake).
     let mut indexer_stream: Option<IndexerStream> = None;
-    let mut indexer_connect: Option<tokio::task::JoinHandle<Result<IndexerStream>>> = None;
-    let mut handshake_done = false;
-    let indexer_url = indexer_url_opt.clone().unwrap_or_default();
+
     tracing::info!(
-        "Electrum session started for {} [{}] (indexer after handshake)",
+        "Electrum session started for {} [{}] (sync RPC responses)",
         peer_addr,
         source_label
     );
 
     let mut client_buf = Vec::new();
-    let mut indexer_buf = Vec::new();
     let mut session = SessionState::new();
 
     loop {
-        tokio::select! {
-            result = client_stream.read_buf(&mut client_buf) => {
-                match result {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        while let Some(newline_pos) = client_buf.iter().position(|&b| b == b'\n') {
-                            let line_bytes = client_buf[..newline_pos].to_vec();
-                            client_buf.drain(..=newline_pos);
-                            let line_str = String::from_utf8_lossy(&line_bytes).to_string();
+        let n = client_stream.read_buf(&mut client_buf).await?;
+        if n == 0 {
+            break;
+        }
+        while let Some(newline_pos) = client_buf.iter().position(|&b| b == b'\n') {
+            let line_bytes = client_buf[..newline_pos].to_vec();
+            client_buf.drain(..=newline_pos);
+            let line_str = String::from_utf8_lossy(&line_bytes).to_string();
 
-                            process_client_line(
-                                &line_bytes,
-                                &line_str,
-                                peer_addr,
-                                &pool_manager,
-                                &config,
-                                &indexer_url,
-                                &mut indexer_stream,
-                                &mut session,
-                                source_label,
-                                &mut client_stream,
-                            )
-                            .await?;
-
-                            if !handshake_done {
-                                handshake_done = true;
-                                if let Some(ref url) = indexer_url_opt {
-                                    let url = url.clone();
-                                    tracing::info!(
-                                        "Opening upstream electrs for {} after handshake",
-                                        peer_addr
-                                    );
-                                    indexer_connect = Some(tokio::spawn(async move {
-                                        connect_indexer(&url).await
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Client read error: {}", e);
-                        break;
-                    }
-                }
-            }
-            result = async {
-                if let Some(handle) = indexer_connect.as_mut() {
-                    handle.await
-                } else {
-                    std::future::pending().await
-                }
-            }, if handshake_done && indexer_connect.is_some() && indexer_stream.is_none() => {
-                indexer_connect = None;
-                match result {
-                    Ok(Ok(s)) => {
-                        tracing::info!("Upstream indexer connected for {}", peer_addr);
-                        indexer_stream = Some(s);
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            "Upstream indexer connect failed for {}: {}",
-                            peer_addr,
-                            e
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!("Indexer connect task failed for {}: {}", peer_addr, e);
-                    }
-                }
-            }
-            result = async {
-                match indexer_stream.as_mut() {
-                    Some(s) => s.read_buf(&mut indexer_buf).await,
-                    None => std::future::pending().await,
-                }
-            }, if indexer_stream.is_some() => {
-                match result {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        while let Some(newline_pos) = indexer_buf.iter().position(|&b| b == b'\n') {
-                            let line_bytes = indexer_buf[..newline_pos].to_vec();
-                            indexer_buf.drain(..=newline_pos);
-                            let out = process_indexer_line(
-                                &line_bytes,
-                                &mut session,
-                                &pool_manager,
-                                &indexer_url,
-                            )?;
-                            if session.client_busy {
-                                session.deferred_indexer_out.push(out);
-                            } else {
-                                client_stream.write_all(&out).await?;
-                                client_stream.flush().await?;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("Indexer read error: {}", e);
-                        break;
-                    }
-                }
-            }
+            process_client_line(
+                &line_bytes,
+                &line_str,
+                peer_addr,
+                &pool_manager,
+                &config,
+                &indexer_url,
+                &mut indexer_stream,
+                &mut session,
+                source_label,
+                &mut client_stream,
+            )
+            .await?;
         }
     }
 
