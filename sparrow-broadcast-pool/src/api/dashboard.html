@@ -1131,7 +1131,7 @@
                         <h4 data-i18n="wizard_settings_title">Settings</h4>
                         <ul>
                             <li data-i18n="wizard_settings_1">Broadcast mode: Immediate, Scheduled, or By block height.</li>
-                            <li data-i18n="wizard_settings_2">Wallet URL: use Host:50050 from Settings (not electrs).</li>
+                            <li data-i18n="wizard_settings_2">Wallet URL: Host:50050 from Settings. Disable Sparrow Tor proxy or txs bypass this pool.</li>
                             <li data-i18n="wizard_settings_3">BTC prices checked every 60s (Kraken, CoinGecko, Bitstamp).</li>
                         </ul>
                     </div>
@@ -1208,7 +1208,7 @@
                 cfg_min_delay: 'Min Delay (hours)', cfg_min_delay_hint: 'Minimum random delay before broadcast',
                 cfg_max_delay: 'Max Delay (hours)', cfg_max_delay_hint: 'Maximum random delay before broadcast',
                 cfg_reset: 'Reset', cfg_save: 'Save Settings',
-                cfg_wallet_title: 'Wallet Connection', cfg_wallet_hint: 'Configure your wallet to connect to Broadcast Pool here', cfg_wallet_url: 'Use this URL in your wallet server settings', cfg_wallet_warning: 'Use your Umbrel LAN IP (same as in the browser). Do not use the electrs indexer.',
+                cfg_wallet_title: 'Wallet Connection', cfg_wallet_hint: 'Configure your wallet to connect to Broadcast Pool here', cfg_wallet_url: 'Use this URL in your wallet server settings', cfg_wallet_warning: 'Use your Umbrel LAN IP (same as in the browser). Do not use the electrs indexer. In Sparrow: Settings → Network → disable Tor proxy or broadcasts bypass this pool.',
                 detail_title: 'Transaction Details', detail_pool_id: 'Pool ID', detail_status: 'Status', detail_network: 'Network',
                 detail_scheduled: 'Scheduled', detail_fee_rate: 'Fee Rate',
                 detail_utxos: 'UTXOs', detail_broadcast_at: 'Broadcast At', detail_confirmed_at: 'Confirmed At',
@@ -1260,7 +1260,7 @@
                 wizard_s4_lead: 'Global settings apply to transactions with a real locktime in the TX itself (not manual pending ones).',
                 wizard_settings_title: 'Settings',
                 wizard_settings_1: 'Broadcast mode: Immediate, Scheduled, or By block height.',
-                wizard_settings_2: 'Wallet URL: use Host:50050 from Settings (not electrs).',
+                wizard_settings_2: 'Wallet URL: Host:50050 from Settings. Disable Sparrow Tor proxy or txs bypass this pool.',
                 wizard_settings_3: 'BTC prices checked every 60s (Kraken, CoinGecko, Bitstamp).',
                 wizard_dismiss: 'Don\u2019t show this guide again',
                 wizard_skip: 'Skip guide',
@@ -1314,7 +1314,7 @@
                 cfg_min_delay: 'Retraso M\u00ednimo (horas)', cfg_min_delay_hint: 'Retraso aleatorio m\u00ednimo antes de transmisi\u00f3n',
                 cfg_max_delay: 'Retraso M\u00e1ximo (horas)', cfg_max_delay_hint: 'Retraso aleatorio m\u00e1ximo antes de transmisi\u00f3n',
                 cfg_reset: 'Restablecer', cfg_save: 'Guardar Configuraci\u00f3n',
-                cfg_wallet_title: 'Conexi\u00f3n Wallet', cfg_wallet_hint: 'Configura tu wallet para conectarse aqu\u00ed', cfg_wallet_url: 'Usar esta URL en la configuraci\u00f3n del servidor de tu wallet', cfg_wallet_warning: 'Usa la IP LAN de Umbrel (la misma del navegador). No uses el indexer electrs.',
+                cfg_wallet_title: 'Conexi\u00f3n Wallet', cfg_wallet_hint: 'Configura tu wallet para conectarse aqu\u00ed', cfg_wallet_url: 'Usar esta URL en la configuraci\u00f3n del servidor de tu wallet', cfg_wallet_warning: 'Usa la IP LAN de Umbrel (la misma del navegador). No uses el indexer electrs. En Sparrow: Ajustes \u2192 Red \u2192 desactiva el proxy Tor o los env\u00edos no llegan al pool.',
                 detail_title: 'Detalles de Transacci\u00f3n', detail_pool_id: 'ID del Pool', detail_status: 'Estado', detail_network: 'Red',
                 detail_scheduled: 'Programada', detail_fee_rate: 'Tarifa',
                 detail_utxos: 'UTXOs', detail_broadcast_at: 'Transmitida el', detail_confirmed_at: 'Confirmada el',
@@ -1366,7 +1366,7 @@
                 wizard_s4_lead: 'La configuraci\u00f3n global aplica a TX con locktime real en la transacci\u00f3n (no a las manuales pendientes).',
                 wizard_settings_title: 'Configuraci\u00f3n',
                 wizard_settings_1: 'Modo de transmisi\u00f3n: Inmediato, Programado o Por altura de bloque.',
-                wizard_settings_2: 'URL wallet: Host:50050 en Configuraci\u00f3n (no electrs).',
+                wizard_settings_2: 'URL wallet: Host:50050. Desactiva proxy Tor en Sparrow o las TX no llegan al pool.',
                 wizard_settings_3: 'Precios BTC cada 60s (Kraken, CoinGecko, Bitstamp).',
                 wizard_dismiss: 'No volver a mostrar esta gu\u00eda',
                 wizard_skip: 'Omitir gu\u00eda',

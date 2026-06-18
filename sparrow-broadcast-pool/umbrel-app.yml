@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.2.18"
+version: "0.2.19"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,15 +31,13 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.2.18 — Fix Sparrow broadcast RPC never reaching pool (MTP / block-height txs).
+  v0.2.19 — Sparrow Tor bypass fix + mempool notify after broadcast.
 
-  - Answer blockchain.estimatefee, relayfee, fee histogram locally (no electrs blocking)
+  - Warn in logs, server.banner and dashboard: disable Sparrow Tor proxy or broadcasts go to mempool.space
 
-  - Log every incoming line mentioning broadcast/transaction for diagnosis
+  - Faster scripthash subscription notify after ingest (Sparrow mempool wait)
 
-  - Intercept broadcast_package and Sparrow string-param broadcast formats
-
-  - Warn on large JSON buffered without newline (split-read detection)
+  - Log large Electrum RPC lines to diagnose missing broadcast RPC
 developer: criptoworld8484
 website: https://github.com/criptoworld8484/umbrel-apps
 repo: https://github.com/criptoworld8484/umbrel-apps/tree/master/sparrow-broadcast-pool

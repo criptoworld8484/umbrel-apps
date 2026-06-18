@@ -541,7 +541,10 @@ fn local_electrum_response(
         })),
         "server.banner" => Some(serde_json::json!({
             "jsonrpc": "2.0",
-            "result": format!("broadcast-pool {} — Bitcoin transaction pool for Sparrow", env!("CARGO_PKG_VERSION")),
+            "result": format!(
+                "broadcast-pool {} — Disable Sparrow Tor proxy (Settings→Network) or broadcasts go to mempool.space, not this pool.",
+                env!("CARGO_PKG_VERSION")
+            ),
             "id": id
         })),
         "server.ping" => Some(serde_json::json!({
@@ -773,16 +776,23 @@ async fn notify_subscriptions(
 ) -> Result<()> {
     for sh in scripthashes {
         if !subscribed.contains(sh) {
+            tracing::debug!(
+                "Skip post-broadcast notify for {} (not subscribed)",
+                &sh[..sh.len().min(16)]
+            );
             continue;
         }
+        let pending = pool_manager.get_pending_txids_for_scripthash(sh);
+        if pending.is_empty() {
+            continue;
+        }
+        let pending_for_fallback = pending.clone();
         let sh_clone = sh.clone();
-        let pm = pool_manager.clone();
         let url = indexer_url.clone();
         let new_hash = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(2),
             tokio::task::spawn_blocking(move || {
                 let real_history = fetch_scripthash_history_sync(&sh_clone, &url);
-                let pending = pm.get_pending_txids_for_scripthash(&sh_clone);
                 pending::compute_modified_status_hash(real_history, &sh_clone, &pending)
             }),
         )
@@ -792,11 +802,14 @@ async fn notify_subscriptions(
             Ok(Ok(h)) => h,
             Ok(Err(e)) => {
                 tracing::warn!("Subscription notify task failed for {}: {}", &sh[..sh.len().min(16)], e);
-                continue;
+                pending::compute_modified_status_hash(vec![], sh, &pending_for_fallback)
             }
             Err(_) => {
-                tracing::warn!("Subscription notify timed out for {}", &sh[..sh.len().min(16)]);
-                continue;
+                tracing::warn!(
+                    "Subscription notify timed out for {}, using pending-only hash",
+                    &sh[..sh.len().min(16)]
+                );
+                pending::compute_modified_status_hash(vec![], sh, &pending_for_fallback)
             }
         };
 
@@ -814,6 +827,7 @@ async fn notify_subscriptions(
                 .write_all(&serde_json::to_vec(&notification)?)
                 .await?;
             client_stream.write_all(b"\n").await?;
+            client_stream.flush().await?;
         }
     }
     Ok(())
@@ -1014,10 +1028,17 @@ async fn run_electrum_listener(
         match listener.accept().await {
             Ok((client_stream, peer_addr)) => {
                 tracing::info!(
-                    "Electrum client connected from {} [{}]",
+                    "Electrum client connected from {} [{}] (broadcast-pool v{})",
                     peer_addr,
-                    source_label
+                    source_label,
+                    env!("CARGO_PKG_VERSION")
                 );
+                if source_label == "sparrow" {
+                    tracing::warn!(
+                        "Sparrow [{}]: disable Tor proxy in Settings→Network or broadcasts bypass this pool (mempool.space) and txs never appear here",
+                        peer_addr
+                    );
+                }
                 let pool_manager = pool_manager.clone();
                 let config = config.clone();
                 tokio::spawn(async move {
@@ -1070,6 +1091,17 @@ async fn process_client_line(
     }
 
     log_incoming_client_line(peer_addr, line_str, source_label);
+
+    if line_str.len() > 280 {
+        tracing::info!(
+            "Electrum large RPC from {} [{}] len={} methods={:?}",
+            peer_addr,
+            source_label,
+            line_str.len(),
+            peek_line_methods(line_str)
+        );
+    }
+
     if line_mentions_tx_rpc(line_str) {
         if let Some(methods) = peek_line_methods(line_str) {
             tracing::info!(
@@ -1225,9 +1257,10 @@ async fn handle_connection(
     let mut indexer_stream: Option<IndexerStream> = None;
 
     tracing::info!(
-        "Electrum session started for {} [{}] (sync RPC responses)",
+        "Electrum session started for {} [{}] (broadcast-pool v{}, sync RPC responses)",
         peer_addr,
-        source_label
+        source_label,
+        env!("CARGO_PKG_VERSION")
     );
 
     let mut client_buf = Vec::new();
