@@ -791,18 +791,6 @@ async fn handle_one_subrequest(
         return Ok(resp);
     }
 
-    if request.method == "blockchain.headers.subscribe" {
-        tracing::debug!("blockchain.headers.subscribe answered locally (no electrs blocking)");
-        return Ok(serde_json::json!({
-            "jsonrpc": "2.0",
-            "result": {
-                "height": 0,
-                "hex": "0".repeat(160)
-            },
-            "id": request.id
-        }));
-    }
-
     if is_broadcast_method(&request.method) {
         return Ok(serde_json::json!({
             "jsonrpc": "2.0",
@@ -1271,13 +1259,31 @@ async fn process_client_line(
 
     // Handshake RPCs: always answer locally (never block on upstream electrs).
     if let Ok(handshake) = parse_subrequests(line_str) {
-        if handshake.len() == 1 && is_local_handshake_method(&handshake[0].method) {
-            if let Some(resp) = local_electrum_response(&handshake[0], config) {
-                write_client_responses(client_stream, &[resp], false).await?;
+        if !handshake.is_empty()
+            && handshake
+                .iter()
+                .all(|r| is_local_handshake_method(&r.method))
+        {
+            let mut responses = Vec::with_capacity(handshake.len());
+            for req in &handshake {
+                if let Some(resp) = local_electrum_response(req, config) {
+                    responses.push(resp);
+                } else {
+                    responses.clear();
+                    break;
+                }
+            }
+            if responses.len() == handshake.len() {
+                let batch = line_is_batch(line_str);
+                write_client_responses(client_stream, &responses, batch).await?;
                 tracing::info!(
                     "Electrum RPC from {}: [{}] (local handshake)",
                     peer_addr,
-                    handshake[0].method
+                    handshake
+                        .iter()
+                        .map(|r| r.method.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
                 return Ok(());
             }
