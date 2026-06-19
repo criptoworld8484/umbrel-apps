@@ -347,6 +347,9 @@ struct SessionState {
     /// While handling a client JSON-RPC line, defer upstream notifications to avoid interleaving.
     client_busy: bool,
     deferred_indexer_out: Vec<Vec<u8>>,
+    /// Sparrow diagnostics: did this session ever send a broadcast RPC?
+    broadcast_intercepted: bool,
+    rpc_lines_handled: u32,
 }
 
 impl SessionState {
@@ -356,6 +359,32 @@ impl SessionState {
             pending_methods: HashMap::new(),
             client_busy: false,
             deferred_indexer_out: Vec::new(),
+            broadcast_intercepted: false,
+            rpc_lines_handled: 0,
+        }
+    }
+
+    fn log_disconnect_summary(&self, peer_addr: std::net::SocketAddr, source_label: &str) {
+        if source_label != "sparrow" {
+            return;
+        }
+        if self.broadcast_intercepted {
+            tracing::info!(
+                "Sparrow session ended {} (handled {} RPC lines, broadcast received)",
+                peer_addr,
+                self.rpc_lines_handled
+            );
+            return;
+        }
+        if self.rpc_lines_handled > 3 {
+            tracing::error!(
+                "Sparrow session ended {} without any broadcast RPC ({} lines handled). \
+                 If txs stay on 'Broadcasting' or never appear in the pool: disable Tor/proxy in \
+                 Sparrow Settings→Network — Sparrow sends broadcasts to mempool.space over Tor \
+                 instead of this Electrum server when proxy/Tor is active.",
+                peer_addr,
+                self.rpc_lines_handled
+            );
         }
     }
 
@@ -575,7 +604,9 @@ fn local_electrum_response(
                     "protocol_min": "1.0",
                     "protocol_version": "1.4",
                     "server_version": format!("broadcast-pool {}", env!("CARGO_PKG_VERSION")),
-                    "hash_function": "sha256"
+                    "hash_function": "sha256",
+                    "broadcast_pool": true,
+                    "sparrow_tor_warning": "Disable Sparrow Settings→Network proxy/Tor or broadcasts bypass this pool"
                 },
                 "id": id
             }))
@@ -899,8 +930,9 @@ async fn intercept_and_handle_broadcast(
     config: &Arc<Mutex<Config>>,
     indexer_url: &str,
     source_label: &str,
-    session: &SessionState,
+    session: &mut SessionState,
 ) -> Result<()> {
+    session.broadcast_intercepted = true;
     tracing::info!("INTERCEPTED broadcast RPC (hex len={})", hex_param.len());
 
     let hex_quick = hex_param.clone();
@@ -1170,6 +1202,8 @@ async fn process_client_line(
         return Ok(());
     }
 
+    session.rpc_lines_handled += 1;
+
     // Handshake RPCs: always answer locally (never block on upstream electrs).
     if let Ok(handshake) = parse_subrequests(line_str) {
         if handshake.len() == 1 && is_local_handshake_method(&handshake[0].method) {
@@ -1383,6 +1417,7 @@ async fn handle_connection(
     loop {
         let n = client_stream.read_buf(&mut client_buf).await?;
         if n == 0 {
+            session.log_disconnect_summary(peer_addr, source_label);
             break;
         }
         while let Some(newline_pos) = client_buf.iter().position(|&b| b == b'\n') {
@@ -1916,12 +1951,33 @@ fn handle_broadcast(
         tx_hex: &str,
         indexer_url: &str,
     ) -> Result<Vec<String>> {
-        // fast=true only needs output scripthashes from the tx hex (no indexer RPC).
-        let scripthashes = pending::extract_affected_scripthashes_opts(tx_hex, "", true)
-            .unwrap_or_else(|e| {
-                tracing::warn!("Could not derive scripthashes for {}: {}", txid, e);
+        // Sparrow polls get_history on INPUT wallet scripthashes after broadcast — outputs-only is not enough.
+        let scripthashes = if !indexer_url.is_empty() {
+            match pending::extract_affected_scripthashes_opts(tx_hex, indexer_url, false) {
+                Ok(sh) => {
+                    tracing::info!(
+                        "Indexed {} scripthash(es) for {} (inputs+outputs via indexer)",
+                        sh.len(),
+                        txid
+                    );
+                    sh
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Full scripthash extract failed for {} ({}), falling back to outputs only",
+                        txid,
+                        e
+                    );
+                    pending::extract_affected_scripthashes_opts(tx_hex, "", true)
+                        .unwrap_or_default()
+                }
+            }
+        } else {
+            pending::extract_affected_scripthashes_opts(tx_hex, "", true).unwrap_or_else(|e| {
+                tracing::warn!("Could not derive output scripthashes for {}: {}", txid, e);
                 Vec::new()
-            });
+            })
+        };
         let outputs: Vec<PendingTxOutput> = pending::extract_outputs(tx_hex)
             .unwrap_or_default()
             .into_iter()
@@ -1932,8 +1988,11 @@ fn handle_broadcast(
             })
             .collect();
         pool_manager.store_pending_tx(txid, tx_hex, scripthashes.clone(), outputs);
-        if indexer_url.is_empty() && scripthashes.is_empty() {
-            tracing::debug!("Stored {} without scripthashes (indexer not required for ingest)", txid);
+        if scripthashes.is_empty() {
+            tracing::warn!(
+                "Stored {} without scripthashes — Sparrow mempool poll may fail until electrs is reachable",
+                txid
+            );
         }
         Ok(scripthashes)
     }
@@ -2062,5 +2121,12 @@ mod tests {
         };
         let resp = local_fast_response(&req).expect("estimatefee");
         assert!(resp.get("result").is_some());
+    }
+
+    #[test]
+    fn fast_scripthash_extract_is_outputs_only() {
+        use crate::pool::virtual_mempool as pending;
+        let fast = pending::extract_affected_scripthashes_opts(SAMPLE_TX, "", true).expect("fast");
+        assert_eq!(fast.len(), 2, "sample tx has two outputs");
     }
 }
