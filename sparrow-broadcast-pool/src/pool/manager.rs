@@ -975,6 +975,34 @@ impl PoolManager {
         );
     }
 
+    /// Merge additional scripthashes (e.g. input addresses after electrs enrichment).
+    pub fn merge_pending_scripthashes(&self, txid: &str, extra: &[String]) {
+        if extra.is_empty() {
+            return;
+        }
+        let mut pending = match self.lock_pending() {
+            Some(p) => p,
+            None => return,
+        };
+        let Some(info) = pending.get_mut(txid) else {
+            return;
+        };
+        let before = info.scripthashes.len();
+        for sh in extra {
+            if !info.scripthashes.contains(sh) {
+                info.scripthashes.push(sh.clone());
+            }
+        }
+        if info.scripthashes.len() > before {
+            tracing::info!(
+                "Enriched pending tx {} scripthashes: {} → {}",
+                txid,
+                before,
+                info.scripthashes.len()
+            );
+        }
+    }
+
     pub fn lookup_tx_hex(&self, txid: &str) -> Option<String> {
         let normalized = txid.trim().to_lowercase();
         if let Some(hex) = self.get_pending_tx_hex(&normalized) {

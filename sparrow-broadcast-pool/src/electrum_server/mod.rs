@@ -683,6 +683,49 @@ fn line_is_batch(line: &str) -> bool {
     line.trim_start().starts_with('[')
 }
 
+/// Prefer live pool indexer URL (healed after Umbrel startup) over session snapshot.
+fn resolve_live_indexer_url(pool_manager: &PoolManager, config: &Arc<Mutex<Config>>) -> String {
+    if let Some(url) = pool_manager.get_indexer_url() {
+        if !url.is_empty() {
+            return url;
+        }
+    }
+    config
+        .lock()
+        .ok()
+        .and_then(|c| c.indexer.as_ref().map(|i| i.url.clone()))
+        .unwrap_or_default()
+}
+
+/// Process broadcast lines before other buffered RPCs so subscribe storms do not delay sends.
+fn pop_client_line(client_buf: &mut Vec<u8>) -> Option<(Vec<u8>, String)> {
+    let mut line_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    for (i, &b) in client_buf.iter().enumerate() {
+        if b == b'\n' {
+            line_ranges.push((start, i));
+            start = i + 1;
+        }
+    }
+    if line_ranges.is_empty() {
+        return None;
+    }
+    let pick = line_ranges
+        .iter()
+        .position(|&(s, e)| {
+            let line_str = String::from_utf8_lossy(&client_buf[s..e]);
+            extract_broadcast_hex(&line_str).is_some() || line_looks_like_broadcast(&line_str)
+        })
+        .unwrap_or(0);
+    let (s, e) = line_ranges[pick];
+    let line_bytes = client_buf[s..e].to_vec();
+    client_buf.drain(..=e);
+    let line_str = String::from_utf8_lossy(&line_bytes)
+        .trim_end_matches('\r')
+        .to_string();
+    Some((line_bytes, line_str))
+}
+
 async fn forward_subrequest_sync(
     request: &JsonRpcRequest,
     indexer_url: &str,
@@ -697,9 +740,23 @@ async fn forward_subrequest_sync(
     let raw = serde_json::to_string(request)?;
     let url = indexer_url.to_string();
     let id = request.id.clone();
-    let response_str = tokio::task::spawn_blocking(move || forward_to_indexer_sync(&raw, &url))
-        .await
-        .context("sync forward task failed")?;
+    let response_str = match tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        tokio::task::spawn_blocking(move || forward_to_indexer_sync(&raw, &url)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => {
+            tracing::warn!("Indexer forward timed out for {}", request.method);
+            return Ok(serde_json::json!({
+                "jsonrpc": "2.0",
+                "error": { "code": -32000, "message": "Indexer temporarily unavailable" },
+                "id": id
+            }));
+        }
+    };
     let Some(resp_str) = response_str else {
         return Ok(serde_json::json!({
             "jsonrpc": "2.0",
@@ -735,19 +792,11 @@ async fn handle_one_subrequest(
     }
 
     if request.method == "blockchain.headers.subscribe" {
-        let height = pool_manager
-            .check_block_height()
-            .ok()
-            .flatten()
-            .unwrap_or(0);
-        tracing::debug!(
-            "blockchain.headers.subscribe answered locally (height={})",
-            height
-        );
+        tracing::debug!("blockchain.headers.subscribe answered locally (no electrs blocking)");
         return Ok(serde_json::json!({
             "jsonrpc": "2.0",
             "result": {
-                "height": height,
+                "height": 0,
                 "hex": "0".repeat(160)
             },
             "id": request.id
@@ -991,14 +1040,17 @@ async fn intercept_and_handle_broadcast(
     let src = source_label.to_string();
     let hex_owned = hex_param;
 
-    let ingest = tokio::task::spawn_blocking(move || {
-        handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
-    })
+    let ingest = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        tokio::task::spawn_blocking(move || {
+            handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
+        }),
+    )
     .await;
 
     let result = match ingest {
-        Ok(Ok(result)) => result,
-        Ok(Err(e)) => {
+        Ok(Ok(Ok(result))) => result,
+        Ok(Ok(Err(e))) => {
             tracing::error!("Broadcast ingest failed for {}: {}", preview.txid, e);
             write_json_rpc_response(
                 client_stream,
@@ -1011,7 +1063,20 @@ async fn intercept_and_handle_broadcast(
             .await?;
             return Ok(());
         }
-        Err(e) => {
+        Err(_) => {
+            tracing::error!("Broadcast ingest timed out for {}", preview.txid);
+            write_json_rpc_response(
+                client_stream,
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -25, "message": "Broadcast ingest timed out — check electrs connection" },
+                    "id": id
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        Ok(Err(e)) => {
             tracing::error!("Broadcast ingest task failed for {}: {}", preview.txid, e);
             write_json_rpc_response(
                 client_stream,
@@ -1398,10 +1463,6 @@ async fn handle_connection(
     peer_addr: std::net::SocketAddr,
     source_label: &'static str,
 ) -> Result<()> {
-    let indexer_url = {
-        let cfg = config.lock().map_err(|e| anyhow::anyhow!("Config lock: {}", e))?;
-        cfg.indexer.as_ref().map(|idx| idx.url.clone()).unwrap_or_default()
-    };
     let mut indexer_stream: Option<IndexerStream> = None;
 
     tracing::info!(
@@ -1420,12 +1481,8 @@ async fn handle_connection(
             session.log_disconnect_summary(peer_addr, source_label);
             break;
         }
-        while let Some(newline_pos) = client_buf.iter().position(|&b| b == b'\n') {
-            let line_bytes = client_buf[..newline_pos].to_vec();
-            client_buf.drain(..=newline_pos);
-            let line_str = String::from_utf8_lossy(&line_bytes)
-                .trim_end_matches('\r')
-                .to_string();
+        while let Some((line_bytes, line_str)) = pop_client_line(&mut client_buf) {
+            let indexer_url = resolve_live_indexer_url(&pool_manager, &config);
 
             process_client_line(
                 &line_bytes,
@@ -1951,33 +2008,12 @@ fn handle_broadcast(
         tx_hex: &str,
         indexer_url: &str,
     ) -> Result<Vec<String>> {
-        // Sparrow polls get_history on INPUT wallet scripthashes after broadcast — outputs-only is not enough.
-        let scripthashes = if !indexer_url.is_empty() {
-            match pending::extract_affected_scripthashes_opts(tx_hex, indexer_url, false) {
-                Ok(sh) => {
-                    tracing::info!(
-                        "Indexed {} scripthash(es) for {} (inputs+outputs via indexer)",
-                        sh.len(),
-                        txid
-                    );
-                    sh
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Full scripthash extract failed for {} ({}), falling back to outputs only",
-                        txid,
-                        e
-                    );
-                    pending::extract_affected_scripthashes_opts(tx_hex, "", true)
-                        .unwrap_or_default()
-                }
-            }
-        } else {
-            pending::extract_affected_scripthashes_opts(tx_hex, "", true).unwrap_or_else(|e| {
+        // Phase 1: outputs immediately (Sparrow ack must not wait on electrs).
+        let output_sh = pending::extract_affected_scripthashes_opts(tx_hex, "", true)
+            .unwrap_or_else(|e| {
                 tracing::warn!("Could not derive output scripthashes for {}: {}", txid, e);
                 Vec::new()
-            })
-        };
+            });
         let outputs: Vec<PendingTxOutput> = pending::extract_outputs(tx_hex)
             .unwrap_or_default()
             .into_iter()
@@ -1987,14 +2023,48 @@ fn handle_broadcast(
                 scripthash,
             })
             .collect();
-        pool_manager.store_pending_tx(txid, tx_hex, scripthashes.clone(), outputs);
-        if scripthashes.is_empty() {
+        pool_manager.store_pending_tx(txid, tx_hex, output_sh.clone(), outputs);
+
+        // Phase 2: input scripthashes (Sparrow polls INPUT addresses) — bounded electrs budget.
+        let mut all_sh = output_sh;
+        if !indexer_url.is_empty() {
+            match pending::extract_affected_scripthashes_timed(
+                tx_hex,
+                indexer_url,
+                std::time::Duration::from_secs(6),
+            ) {
+                Ok(full) => {
+                    let extra: Vec<String> = full
+                        .iter()
+                        .filter(|s| !all_sh.contains(s))
+                        .cloned()
+                        .collect();
+                    if !extra.is_empty() {
+                        pool_manager.merge_pending_scripthashes(txid, &extra);
+                    }
+                    all_sh = full;
+                    tracing::info!(
+                        "Indexed {} scripthash(es) for {} (outputs + inputs via electrs)",
+                        all_sh.len(),
+                        txid
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Input scripthash enrichment failed for {} ({} outputs indexed): {}",
+                        txid,
+                        all_sh.len(),
+                        e
+                    );
+                }
+            }
+        } else if all_sh.is_empty() {
             tracing::warn!(
-                "Stored {} without scripthashes — Sparrow mempool poll may fail until electrs is reachable",
+                "Stored {} without scripthashes — electrs not configured; Sparrow mempool poll may fail",
                 txid
             );
         }
-        Ok(scripthashes)
+        Ok(all_sh)
     }
 
     // Protocol: always retain in virtual mempool; scheduler emits to the network

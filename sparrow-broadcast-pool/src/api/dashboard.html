@@ -783,6 +783,10 @@
                     <h3 data-i18n="protocol_banner_title">Virtual Mempool Active</h3>
                     <p data-i18n="protocol_banner_text">Transactions from your wallet are retained locally and shown as pending. Broadcast happens when the scheduler triggers.</p>
                 </div>
+                <div id="sparrow-readiness-banner" class="protocol-banner" style="display:none; border-color: var(--amber); margin-top: 12px;">
+                    <h3 id="sparrow-readiness-title" data-i18n="sparrow_readiness_title">Sparrow setup required</h3>
+                    <p id="sparrow-readiness-text"></p>
+                </div>
                 <div class="stats">
                     <div class="stat-card">
                         <div class="label" data-i18n="stat_block_height">Block Height</div>
@@ -1172,6 +1176,10 @@
                 stat_broadcast: 'Broadcast', stat_broadcast_sub: 'In mempool',
                 stat_confirmed: 'Confirmed', stat_confirmed_sub: 'In blockchain',
                 stat_mempool: 'Mempool', stat_mempool_sub: 'Network fee congestion',
+                sparrow_readiness_title: 'Sparrow — check before sending',
+                sparrow_readiness_no_indexer: 'Electrs indexer not connected (required for send confirmation).',
+                sparrow_readiness_tor: 'In Sparrow: Settings→Network → disable proxy and built-in Tor.',
+                sparrow_readiness_url: 'Server URL:',
                 stat_mempool_unavailable: 'Bitcoin node not connected',
                 stat_mempool_cong_low: 'Low', stat_mempool_cong_medium: 'Medium', stat_mempool_cong_high: 'High',
                 stat_total: 'Total', stat_total_sub: 'All transactions',
@@ -1278,6 +1286,10 @@
                 stat_broadcast: 'Transmitida', stat_broadcast_sub: 'En mempool',
                 stat_confirmed: 'Confirmada', stat_confirmed_sub: 'En blockchain',
                 stat_mempool: 'Mempool', stat_mempool_sub: 'Congesti\u00f3n de fees en red',
+                sparrow_readiness_title: 'Sparrow — revisar antes de enviar',
+                sparrow_readiness_no_indexer: 'Indexer electrs no conectado (necesario para confirmar env\u00edos).',
+                sparrow_readiness_tor: 'En Sparrow: Ajustes\u2192Red \u2192 desactiva proxy y Tor integrado.',
+                sparrow_readiness_url: 'URL servidor:',
                 stat_mempool_unavailable: 'Nodo Bitcoin no conectado',
                 stat_mempool_cong_low: 'Baja', stat_mempool_cong_medium: 'Media', stat_mempool_cong_high: 'Alta',
                 stat_total: 'Total', stat_total_sub: 'Todas las transacciones',
@@ -1759,13 +1771,32 @@
             document.getElementById('schedule-overlay').classList.add('active');
         }
 
+        function updateSparrowReadinessBanner(status) {
+            const el = document.getElementById('sparrow-readiness-banner');
+            const text = document.getElementById('sparrow-readiness-text');
+            if (!el || !text || !status) return;
+            if (status.sparrow_ready) {
+                el.style.display = 'none';
+                return;
+            }
+            el.style.display = 'block';
+            const parts = [];
+            if (!status.electrum_connected) parts.push(t('sparrow_readiness_no_indexer'));
+            parts.push(status.sparrow_tor_warning || t('sparrow_readiness_tor'));
+            if (status.wallet_connect_url && !status.wallet_connect_url.includes('<')) {
+                parts.push(t('sparrow_readiness_url') + ' tcp://' + status.wallet_connect_url.replace(/^tcp:\/\//, ''));
+            }
+            text.textContent = parts.join(' ');
+        }
+
         async function refresh() {
             try {
-                const [statsRes, txsRes, priceRes, mempoolRes] = await Promise.all([
+                const [statsRes, txsRes, priceRes, mempoolRes, statusRes] = await Promise.all([
                     fetch('/api/stats'),
                     fetch('/api/transactions'),
                     fetch('/api/btc-price'),
-                    fetch('/api/mempool-status')
+                    fetch('/api/mempool-status'),
+                    fetch('/api/status')
                 ]);
                 const stats = await statsRes.json();
                 allTxs = await txsRes.json();
@@ -1782,6 +1813,10 @@
                     updateDashboardMempoolCard(await mempoolRes.json());
                 } else {
                     updateDashboardMempoolCard({ available: false });
+                }
+
+                if (statusRes.ok) {
+                    updateSparrowReadinessBanner(await statusRes.json());
                 }
 
                 document.getElementById('s-pending').textContent = stats.pending;

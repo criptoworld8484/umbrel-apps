@@ -396,6 +396,9 @@ struct StatusResponse {
     wallet_connect_url: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     indexer_status_hint: String,
+    /// True when electrs is reachable and wallet URL is configured (Umbrel readiness).
+    sparrow_ready: bool,
+    sparrow_tor_warning: String,
 }
 
 #[derive(serde::Serialize, Deserialize)]
@@ -688,8 +691,12 @@ async fn get_status(State(state): State<AppState>) -> Result<Json<StatusResponse
         chain_mtp,
         pool_stats,
         retain_by_default: true,
-        wallet_connect_url: wallet_url,
+        wallet_connect_url: wallet_url.clone(),
         indexer_status_hint,
+        sparrow_ready: electrum_connected
+            && !wallet_url.is_empty()
+            && !wallet_url.contains('<'),
+        sparrow_tor_warning: "Disable Sparrow Settings→Network proxy/Tor or broadcasts bypass this pool (mempool.space). Use tcp://LAN:50050 only.".into(),
     }))
 }
 

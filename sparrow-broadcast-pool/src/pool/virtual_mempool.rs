@@ -321,6 +321,49 @@ pub fn extract_affected_scripthashes_opts(
     Ok(scripthashes.into_iter().collect())
 }
 
+/// Full input+output scripthashes with a wall-clock budget (Umbrel electrs can be slow).
+pub fn extract_affected_scripthashes_timed(
+    tx_hex: &str,
+    indexer_addr: &str,
+    budget: std::time::Duration,
+) -> Result<Vec<String>> {
+    let tx = decode_tx(tx_hex)?;
+    let mut scripthashes = HashSet::new();
+    for output in &tx.output {
+        scripthashes.insert(compute_scripthash(&output.script_pubkey));
+    }
+    if indexer_addr.is_empty() {
+        return Ok(scripthashes.into_iter().collect());
+    }
+    let deadline = std::time::Instant::now() + budget;
+    for input in &tx.input {
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "Scripthash input fetch budget exhausted ({} output sh only so far)",
+                scripthashes.len()
+            );
+            break;
+        }
+        let prev_txid = electrum_txid(&input.previous_output.txid);
+        let vout = input.previous_output.vout as usize;
+        match fetch_prev_tx(&prev_txid, indexer_addr) {
+            Ok(prev_tx) => {
+                if vout < prev_tx.output.len() {
+                    scripthashes.insert(compute_scripthash(&prev_tx.output[vout].script_pubkey));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Could not fetch prev tx {} for scripthash computation: {}",
+                    prev_txid,
+                    e
+                );
+            }
+        }
+    }
+    Ok(scripthashes.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

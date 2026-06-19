@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.2.22"
+version: "0.2.23"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,15 +31,17 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.2.22 — Fix Sparrow broadcast loop (connect OK but txs never reach pool).
+  v0.2.23 — Coordinated Umbrel/Sparrow send path (connection + broadcast together).
 
-  - Index input+output scripthashes via electrs on ingest (Sparrow polls input addresses after send)
+  - Two-phase ingest: outputs stored instantly, input scripthashes enriched via electrs (6s budget)
 
-  - Session diagnostic log when Sparrow connects but never sends broadcast RPC (Tor/proxy bypass)
+  - Live indexer URL per RPC line (fixes stale session after Umbrel electrs discovery)
 
-  - server.features includes sparrow_tor_warning field
+  - Broadcast lines prioritized in TCP buffer; indexer forwards timeout at 8s
 
-  - CRITICAL in Sparrow: Settings→Network → disable proxy AND built-in Tor or broadcasts go to mempool.space
+  - headers.subscribe never blocks on electrs; dashboard Sparrow readiness banner
+
+  - CRITICAL: Sparrow Settings→Network — disable proxy/Tor; use tcp://LAN:50050 (not :50001)
 developer: criptoworld8484
 website: https://github.com/criptoworld8484/umbrel-apps
 repo: https://github.com/criptoworld8484/umbrel-apps/tree/master/sparrow-broadcast-pool
