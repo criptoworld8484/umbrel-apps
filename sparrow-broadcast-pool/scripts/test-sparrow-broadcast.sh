@@ -1,5 +1,5 @@
 #!/bin/bash
-# Simulates Sparrow broadcast RPC (string params + newline-delimited JSON).
+# Simulates Sparrow broadcast + post-broadcast get_history mempool poll.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 pkill -f fake-electrs.py 2>/dev/null || true
@@ -28,7 +28,7 @@ sleep 2
 SAMPLE_TX="0100000002f327e86da3e66bd20e1129b1fb36d07056f0b9a117199e759396526b8f3a20780000000000fffffffff0ede03d75050f20801d50358829ae02c058e8677d2cc74df51f738285013c260000000000ffffffff02f028d6dc010000001976a914ffb035781c3c69e076d48b60c3d38592e7ce06a788ac00ca9a3b000000001976a914fa5139067622fd7e1e722a05c17c2bb7d5fd6df088ac00000000"
 
 python3 -u <<PY
-import json, socket, sys
+import json, socket, sys, hashlib
 sample_tx = """$SAMPLE_TX"""
 
 def read_line(sock):
@@ -41,16 +41,38 @@ def read_line(sock):
     line, _ = buf.split(b"\n", 1)
     return line.decode()
 
+def output_scripthash(tx_hex):
+    # Electrum: reverse(SHA256(script)) — matches electrum-client ToElectrumScriptHash
+    script = bytes.fromhex("76a914ffb035781c3c69e076d48b60c3d38592e7ce06a788ac")
+    h = hashlib.sha256(script).digest()
+    return h[::-1].hex()
+
+sh = output_scripthash(sample_tx)
+print("output scripthash", sh[:16], "...")
+
 s = socket.create_connection(("127.0.0.1", 50050), timeout=3)
-s.settimeout(8)
+s.settimeout(12)
 for name, req in [
     ("server.version", {"jsonrpc":"2.0","method":"server.version","params":["Sparrow Wallet","1.4"],"id":0}),
     ("blockchain.estimatefee", {"jsonrpc":"2.0","method":"blockchain.estimatefee","params":[6],"id":1}),
-    ("blockchain.transaction.broadcast", {"jsonrpc":"2.0","method":"blockchain.transaction.broadcast","params":sample_tx,"id":2}),
+    ("blockchain.transaction.broadcast", {"jsonrpc":"2.0","method":"blockchain.transaction.broadcast","params":sample_tx,"id":3}),
 ]:
     s.sendall((json.dumps(req)+"\n").encode())
     data = read_line(s)
-    print(name, "->", data[:140])
+    print(name, "->", data[:160])
+    if name == "blockchain.transaction.broadcast":
+        txid = json.loads(data).get("result")
+        print("txid", txid[:16], "...")
+
+# Sparrow mempool poll: get_history on output (and typically input) scripthashes
+s.sendall((json.dumps({"jsonrpc":"2.0","method":"blockchain.scripthash.get_history","params":[sh],"id":4})+"\n").encode())
+hist = json.loads(read_line(s))
+entries = hist.get("result", [])
+print("get_history entries", len(entries), entries[:2])
+if not any(e.get("height") == 0 and e.get("tx_hash") == txid for e in entries):
+    print("FAIL: broadcast tx not in get_history at height 0")
+    sys.exit(1)
+print("PASS: get_history shows broadcast tx at height 0")
 s.close()
 PY
 

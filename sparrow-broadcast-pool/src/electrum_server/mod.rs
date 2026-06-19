@@ -771,6 +771,19 @@ async fn forward_subrequest_sync(
     Ok(msg)
 }
 
+fn pending_txids_for_scripthash(
+    pool_manager: &PoolManager,
+    scripthash: &str,
+    indexer_url: &str,
+) -> Vec<String> {
+    let mut pending = pool_manager.get_pending_txids_for_scripthash(scripthash);
+    if pending.is_empty() && pool_manager.has_pending_txs() {
+        pool_manager.enrich_pending_for_scripthash(scripthash, indexer_url);
+        pending = pool_manager.get_pending_txids_for_scripthash(scripthash);
+    }
+    pending
+}
+
 async fn handle_one_subrequest(
     request: &JsonRpcRequest,
     pool_manager: &Arc<PoolManager>,
@@ -807,7 +820,7 @@ async fn handle_one_subrequest(
         || request.method == "blockchain.scripthash.get_mempool"
     {
         if let Some(sh) = scripthash_from_params(&request.params) {
-            let pending = pool_manager.get_pending_txids_for_scripthash(&sh);
+            let pending = pending_txids_for_scripthash(pool_manager, &sh, indexer_url);
             if !pending.is_empty() {
                 tracing::info!(
                     "Fast {} for {} ({} pool tx(s))",
@@ -841,7 +854,7 @@ async fn handle_one_subrequest(
     if request.method == "blockchain.scripthash.subscribe" {
         if let Some(sh) = scripthash_from_params(&request.params) {
             session.subscribed_scripthashes.insert(sh.clone());
-            let pending = pool_manager.get_pending_txids_for_scripthash(&sh);
+            let pending = pending_txids_for_scripthash(pool_manager, &sh, indexer_url);
             if !pending.is_empty() {
                 if let Some(hash) = pending::compute_modified_status_hash(vec![], &sh, &pending) {
                     tracing::info!(
@@ -931,8 +944,10 @@ async fn notify_subscribed_pending_mempool(
     subscribed: &HashSet<String>,
     pool_manager: &PoolManager,
     txid_hint: &str,
+    indexer_url: &str,
 ) -> Result<()> {
     for sh in subscribed {
+        pool_manager.enrich_pending_for_scripthash(sh, indexer_url);
         let pending = pool_manager.get_pending_txids_for_scripthash(sh);
         if pending.is_empty() || !pending.iter().any(|t| t == txid_hint) {
             continue;
@@ -1103,6 +1118,7 @@ async fn intercept_and_handle_broadcast(
             &session.subscribed_scripthashes,
             pool_manager,
             &result.txid,
+            indexer_url,
         )
         .await
         {
@@ -1872,11 +1888,12 @@ fn resolve_ingest_plan(
     }
     // Timestamp nLockTime (Sparrow MTP-by-date or block MTP converted to unix time).
     if nlocktime > 500_000_000 {
+        let scheduled = chrono::DateTime::from_timestamp(nlocktime as i64, 0);
         tracing::info!(
             "Timestamp nLockTime {} → scheduled (MTP enforced when broadcasting)",
             nlocktime
         );
-        return (BroadcastMode::Scheduled, None);
+        return (BroadcastMode::Scheduled, scheduled);
     }
     // Block-height nLockTime — no indexer RPC at ingest; scheduler waits for chain height.
     if nlocktime > 0 && nlocktime < 500_000_000 {
@@ -2031,42 +2048,44 @@ fn handle_broadcast(
             .collect();
         pool_manager.store_pending_tx(txid, tx_hex, output_sh.clone(), outputs);
 
-        // Phase 2: input scripthashes (Sparrow polls INPUT addresses) — bounded electrs budget.
+        // Phase 2: input scripthashes (Sparrow polls INPUT addresses) — local pool first, then electrs.
         let mut all_sh = output_sh;
-        if !indexer_url.is_empty() {
-            match pending::extract_affected_scripthashes_timed(
-                tx_hex,
-                indexer_url,
-                std::time::Duration::from_secs(6),
-            ) {
-                Ok(full) => {
-                    let extra: Vec<String> = full
-                        .iter()
-                        .filter(|s| !all_sh.contains(s))
-                        .cloned()
-                        .collect();
-                    if !extra.is_empty() {
-                        pool_manager.merge_pending_scripthashes(txid, &extra);
-                    }
-                    all_sh = full;
-                    tracing::info!(
-                        "Indexed {} scripthash(es) for {} (outputs + inputs via electrs)",
-                        all_sh.len(),
-                        txid
-                    );
+        let indexer_addr = pending::strip_indexer_host(indexer_url);
+        let lookup = |id: &str| pool_manager.lookup_tx_hex(id);
+        match pending::extract_affected_scripthashes_timed_with_lookup(
+            tx_hex,
+            &indexer_addr,
+            std::time::Duration::from_secs(6),
+            Some(&lookup),
+        ) {
+            Ok(full) => {
+                let extra: Vec<String> = full
+                    .iter()
+                    .filter(|s| !all_sh.contains(s))
+                    .cloned()
+                    .collect();
+                if !extra.is_empty() {
+                    pool_manager.merge_pending_scripthashes(txid, &extra);
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "Input scripthash enrichment failed for {} ({} outputs indexed): {}",
-                        txid,
-                        all_sh.len(),
-                        e
-                    );
-                }
+                all_sh = full;
+                tracing::info!(
+                    "Indexed {} scripthash(es) for {} (outputs + inputs)",
+                    all_sh.len(),
+                    txid
+                );
             }
-        } else if all_sh.is_empty() {
+            Err(e) => {
+                tracing::warn!(
+                    "Input scripthash enrichment failed for {} ({} outputs indexed): {}",
+                    txid,
+                    all_sh.len(),
+                    e
+                );
+            }
+        }
+        if all_sh.is_empty() {
             tracing::warn!(
-                "Stored {} without scripthashes — electrs not configured; Sparrow mempool poll may fail",
+                "Stored {} without scripthashes — Sparrow mempool poll may fail",
                 txid
             );
         }
@@ -2162,8 +2181,9 @@ mod tests {
             "#,
         )
         .expect("test config");
-        let (mode, _) = resolve_ingest_plan("sparrow", 1_750_000_000, &cfg);
+        let (mode, sched) = resolve_ingest_plan("sparrow", 1_750_000_000, &cfg);
         assert_eq!(mode, BroadcastMode::Scheduled);
+        assert!(sched.is_some());
     }
 
     #[test]

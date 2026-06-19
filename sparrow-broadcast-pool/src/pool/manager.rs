@@ -1053,6 +1053,45 @@ impl PoolManager {
             .unwrap_or_default()
     }
 
+    pub fn has_pending_txs(&self) -> bool {
+        self.lock_pending()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Sparrow polls INPUT scripthashes after broadcast; enrich on demand when phase-2 ingest missed.
+    pub fn enrich_pending_for_scripthash(&self, scripthash: &str, indexer_url: &str) {
+        if scripthash.is_empty() {
+            return;
+        }
+        if !self.has_pending_txs() {
+            return;
+        }
+        let indexer_addr = super::virtual_mempool::strip_indexer_host(indexer_url);
+        let budget = std::time::Duration::from_millis(800);
+        let lookup = |id: &str| self.lookup_tx_hex(id);
+        let pending = self.get_all_pending_txs();
+        for (txid, info) in pending {
+            if info.scripthashes.contains(&scripthash.to_string()) {
+                continue;
+            }
+            match super::virtual_mempool::enrich_input_scripthashes(
+                &info.tx_hex,
+                &indexer_addr,
+                budget,
+                Some(&lookup),
+            ) {
+                Ok(extra) if !extra.is_empty() => {
+                    self.merge_pending_scripthashes(&txid, &extra);
+                }
+                Err(e) => {
+                    tracing::warn!("On-demand scripthash enrich failed for {}: {}", txid, e);
+                }
+                Ok(_) => {}
+            }
+        }
+    }
+
     pub fn get_pending_txids_for_scripthash(&self, scripthash: &str) -> Vec<String> {
         let pending = match self.lock_pending() {
             Some(p) => p,
