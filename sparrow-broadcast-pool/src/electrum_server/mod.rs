@@ -337,8 +337,11 @@ struct JsonRpcErrorResponse {
 
 struct BroadcastHandleResult {
     txid: String,
+    tx_hex: String,
     retained: bool,
     affected_scripthashes: Vec<String>,
+    /// Input scripthash enrichment deferred until after Sparrow ack (electrs can be slow on Umbrel).
+    defer_input_enrichment: bool,
 }
 
 struct SessionState {
@@ -741,7 +744,7 @@ async fn forward_subrequest_sync(
     let url = indexer_url.to_string();
     let id = request.id.clone();
     let response_str = match tokio::time::timeout(
-        std::time::Duration::from_secs(8),
+        std::time::Duration::from_secs(2),
         tokio::task::spawn_blocking(move || forward_to_indexer_sync(&raw, &url)),
     )
     .await
@@ -932,6 +935,29 @@ struct BroadcastPreview {
     txid: String,
 }
 
+fn quick_locktime_hint(tx_hex: &str) -> String {
+    let tx_hex_clean = tx_hex.trim();
+    let Ok(raw) = hex::decode(tx_hex_clean) else {
+        return "?".to_string();
+    };
+    let mut cursor = std::io::Cursor::new(&raw);
+    let Ok(tx) = Transaction::consensus_decode(&mut cursor) else {
+        return "?".to_string();
+    };
+    let nlocktime: u32 = match tx.lock_time {
+        bitcoin::absolute::LockTime::Blocks(height) => height.to_consensus_u32(),
+        bitcoin::absolute::LockTime::Seconds(time) => time.to_consensus_u32(),
+        _ => 0,
+    };
+    if nlocktime == 0 {
+        "0 (manual/immediate)".to_string()
+    } else if nlocktime > 500_000_000 {
+        format!("{} (timestamp)", nlocktime)
+    } else {
+        format!("{} (block height)", nlocktime)
+    }
+}
+
 fn quick_broadcast_preview(tx_hex: &str) -> Result<BroadcastPreview> {
     let tx_hex_clean = tx_hex.trim();
     hex::decode(tx_hex_clean).context("Invalid transaction hex")?;
@@ -985,7 +1011,12 @@ async fn intercept_and_handle_broadcast(
     session: &mut SessionState,
 ) -> Result<()> {
     session.broadcast_intercepted = true;
-    tracing::info!("INTERCEPTED broadcast RPC (hex len={})", hex_param.len());
+    let lock_hint = quick_locktime_hint(&hex_param);
+    tracing::info!(
+        "INTERCEPTED broadcast RPC (hex len={}, nLockTime={})",
+        hex_param.len(),
+        lock_hint
+    );
 
     let hex_quick = hex_param.clone();
     let preview = match tokio::time::timeout(
@@ -1044,7 +1075,7 @@ async fn intercept_and_handle_broadcast(
     let hex_owned = hex_param;
 
     let ingest = tokio::time::timeout(
-        std::time::Duration::from_secs(12),
+        std::time::Duration::from_secs(5),
         tokio::task::spawn_blocking(move || {
             handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
         }),
@@ -1124,8 +1155,54 @@ async fn intercept_and_handle_broadcast(
         {
             tracing::warn!("Post-broadcast mempool notify failed: {}", e);
         }
+        if result.defer_input_enrichment {
+            let pm = pool_manager.clone();
+            let url = indexer_url.to_string();
+            let txid = result.txid.clone();
+            let hex = result.tx_hex.clone();
+            tokio::task::spawn_blocking(move || {
+                enrich_pending_input_scripthashes(&pm, &txid, &hex, &url);
+            });
+        }
     }
     Ok(())
+}
+
+fn enrich_pending_input_scripthashes(
+    pool_manager: &PoolManager,
+    txid: &str,
+    tx_hex: &str,
+    indexer_url: &str,
+) {
+    let indexer_addr = pending::strip_indexer_host(indexer_url);
+    let lookup = |id: &str| pool_manager.lookup_tx_hex(id);
+    let output_sh = pending::extract_affected_scripthashes_opts(tx_hex, "", true).unwrap_or_default();
+    match pending::enrich_input_scripthashes(
+        tx_hex,
+        &indexer_addr,
+        std::time::Duration::from_secs(8),
+        Some(&lookup),
+    ) {
+        Ok(extra) if !extra.is_empty() => {
+            pool_manager.merge_pending_scripthashes(txid, &extra);
+            tracing::info!(
+                "Background input scripthash enrichment for {}: {} output + {} input",
+                txid,
+                output_sh.len(),
+                extra.len()
+            );
+        }
+        Ok(_) => {
+            tracing::debug!("Background input enrichment for {} found no extra scripthashes", txid);
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Background input scripthash enrichment failed for {}: {}",
+                txid,
+                e
+            );
+        }
+    }
 }
 
 pub struct ElectrumServer {
@@ -1951,7 +2028,7 @@ fn handle_broadcast(
     tx_hex: &str,
     pool_manager: &Arc<PoolManager>,
     config: &Arc<Mutex<Config>>,
-    indexer_url: &str,
+    _indexer_url: &str,
     source_label: &str,
 ) -> Result<BroadcastHandleResult> {
     tracing::info!("handle_broadcast called with tx_hex length: {}", tx_hex.len());
@@ -2025,13 +2102,11 @@ fn handle_broadcast(
         imported_tx.id
     );
 
-    fn store_retained(
+    fn store_pending_outputs(
         pool_manager: &PoolManager,
         txid: &str,
         tx_hex: &str,
-        indexer_url: &str,
-    ) -> Result<Vec<String>> {
-        // Phase 1: outputs immediately (Sparrow ack must not wait on electrs).
+    ) -> Vec<String> {
         let output_sh = pending::extract_affected_scripthashes_opts(tx_hex, "", true)
             .unwrap_or_else(|e| {
                 tracing::warn!("Could not derive output scripthashes for {}: {}", txid, e);
@@ -2047,53 +2122,17 @@ fn handle_broadcast(
             })
             .collect();
         pool_manager.store_pending_tx(txid, tx_hex, output_sh.clone(), outputs);
-
-        // Phase 2: input scripthashes (Sparrow polls INPUT addresses) — local pool first, then electrs.
-        let mut all_sh = output_sh;
-        let indexer_addr = pending::strip_indexer_host(indexer_url);
-        let lookup = |id: &str| pool_manager.lookup_tx_hex(id);
-        match pending::extract_affected_scripthashes_timed_with_lookup(
-            tx_hex,
-            &indexer_addr,
-            std::time::Duration::from_secs(6),
-            Some(&lookup),
-        ) {
-            Ok(full) => {
-                let extra: Vec<String> = full
-                    .iter()
-                    .filter(|s| !all_sh.contains(s))
-                    .cloned()
-                    .collect();
-                if !extra.is_empty() {
-                    pool_manager.merge_pending_scripthashes(txid, &extra);
-                }
-                all_sh = full;
-                tracing::info!(
-                    "Indexed {} scripthash(es) for {} (outputs + inputs)",
-                    all_sh.len(),
-                    txid
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Input scripthash enrichment failed for {} ({} outputs indexed): {}",
-                    txid,
-                    all_sh.len(),
-                    e
-                );
-            }
-        }
-        if all_sh.is_empty() {
+        if output_sh.is_empty() {
             tracing::warn!(
-                "Stored {} without scripthashes — Sparrow mempool poll may fail",
+                "Stored {} without output scripthashes — Sparrow mempool poll may fail until enrichment",
                 txid
             );
         }
-        Ok(all_sh)
+        output_sh
     }
 
-    // Protocol: always retain in virtual mempool; scheduler emits to the network
-    let scripthashes = store_retained(pool_manager, &txid, tx_hex_clean, indexer_url)?;
+    // Phase 1 only before Sparrow ack; input scripthashes enriched in background after ack.
+    let scripthashes = store_pending_outputs(pool_manager, &txid, tx_hex_clean);
 
     if broadcast_mode == BroadcastMode::Immediate {
         if let Err(e) = pool_manager.mark_as_due(&imported_tx.id) {
@@ -2102,16 +2141,19 @@ fn handle_broadcast(
     }
 
     tracing::info!(
-        "Retained tx {} in virtual mempool (mode: {}, pool_id: {})",
+        "Retained tx {} in virtual mempool (mode: {}, pool_id: {}, {} output sh)",
         txid,
         broadcast_mode,
-        imported_tx.id
+        imported_tx.id,
+        scripthashes.len()
     );
 
     Ok(BroadcastHandleResult {
         txid,
+        tx_hex: tx_hex_clean.to_string(),
         retained: true,
         affected_scripthashes: scripthashes,
+        defer_input_enrichment: true,
     })
 }
 
