@@ -352,6 +352,8 @@ struct SessionState {
     deferred_indexer_out: Vec<Vec<u8>>,
     /// Sparrow diagnostics: did this session ever send a broadcast RPC?
     broadcast_intercepted: bool,
+    /// Last tx acked this session — Sparrow polls input scripthashes before enrichment finishes.
+    recent_broadcast_txid: Option<String>,
     rpc_lines_handled: u32,
 }
 
@@ -363,6 +365,7 @@ impl SessionState {
             client_busy: false,
             deferred_indexer_out: Vec::new(),
             broadcast_intercepted: false,
+            recent_broadcast_txid: None,
             rpc_lines_handled: 0,
         }
     }
@@ -469,17 +472,28 @@ fn modify_upstream_response(
     scripthash: &str,
     pool_manager: &PoolManager,
     indexer_url: &str,
+    session: Option<&SessionState>,
 ) {
     match method {
         "blockchain.scripthash.get_history" => {
             if let Some(result) = msg.get_mut("result").and_then(|r| r.as_array_mut()) {
                 let history = result.clone();
-                let pending = pool_manager.get_pending_txids_for_scripthash(scripthash);
+                let pending = pending_txids_for_scripthash_with_session(
+                    pool_manager,
+                    scripthash,
+                    indexer_url,
+                    session,
+                );
                 *result = pending::inject_in_history(history, scripthash, &pending);
             }
         }
         "blockchain.scripthash.subscribe" => {
-            let pending = pool_manager.get_pending_txids_for_scripthash(scripthash);
+            let pending = pending_txids_for_scripthash_with_session(
+                pool_manager,
+                scripthash,
+                indexer_url,
+                session,
+            );
             if pending.is_empty() {
                 return;
             }
@@ -505,7 +519,12 @@ fn modify_upstream_response(
         }
         "blockchain.scripthash.get_mempool" => {
             if let Some(result) = msg.get_mut("result") {
-                let pending = pool_manager.get_pending_txids_for_scripthash(scripthash);
+                let pending = pending_txids_for_scripthash_with_session(
+                    pool_manager,
+                    scripthash,
+                    indexer_url,
+                    session,
+                );
                 *result = pending::inject_get_mempool(result.clone(), &pending);
             }
         }
@@ -552,7 +571,14 @@ fn process_indexer_line(
         if let Some(id) = msg.get("id") {
             if !id.is_null() {
                 if let Some((method, scripthash)) = session.pending_methods.remove(id) {
-                    modify_upstream_response(&mut msg, &method, &scripthash, pool_manager, indexer_url);
+                    modify_upstream_response(
+                        &mut msg,
+                        &method,
+                        &scripthash,
+                        pool_manager,
+                        indexer_url,
+                        Some(session),
+                    );
                 }
             }
         }
@@ -740,9 +766,19 @@ async fn forward_subrequest_sync(
         indexer_url,
         session,
         pool_manager,
-        std::time::Duration::from_secs(2),
+        indexer_forward_timeout(&request.method),
     )
     .await
+}
+
+fn indexer_forward_timeout(method: &str) -> std::time::Duration {
+    if method.starts_with("blockchain.scripthash.") {
+        std::time::Duration::from_secs(8)
+    } else if method == "blockchain.transaction.get" {
+        std::time::Duration::from_secs(5)
+    } else {
+        std::time::Duration::from_secs(3)
+    }
 }
 
 async fn forward_subrequest_sync_timed(
@@ -786,7 +822,14 @@ async fn forward_subrequest_sync_timed(
     };
     let mut msg: serde_json::Value = serde_json::from_str(resp_str.trim())?;
     if let Some((method, scripthash)) = session.pending_methods.remove(&id) {
-        modify_upstream_response(&mut msg, &method, &scripthash, pool_manager, indexer_url);
+        modify_upstream_response(
+            &mut msg,
+            &method,
+            &scripthash,
+            pool_manager,
+            indexer_url,
+            Some(session),
+        );
     }
     Ok(msg)
 }
@@ -900,6 +943,30 @@ fn pending_txids_for_scripthash(
     pending
 }
 
+fn pending_txids_for_scripthash_with_session(
+    pool_manager: &PoolManager,
+    scripthash: &str,
+    indexer_url: &str,
+    session: Option<&SessionState>,
+) -> Vec<String> {
+    let mut pending = pending_txids_for_scripthash(pool_manager, scripthash, indexer_url);
+    if let Some(session) = session {
+        if let Some(ref txid) = session.recent_broadcast_txid {
+            if session.subscribed_scripthashes.contains(scripthash)
+                && !pending.iter().any(|t| t == txid)
+            {
+                tracing::info!(
+                    "Session fallback for {} → tx {}",
+                    &scripthash[..scripthash.len().min(16)],
+                    &txid[..txid.len().min(16)]
+                );
+                pending.push(txid.clone());
+            }
+        }
+    }
+    pending
+}
+
 async fn handle_one_subrequest(
     request: &JsonRpcRequest,
     pool_manager: &Arc<PoolManager>,
@@ -936,7 +1003,12 @@ async fn handle_one_subrequest(
         || request.method == "blockchain.scripthash.get_mempool"
     {
         if let Some(sh) = scripthash_from_params(&request.params) {
-            let pending = pending_txids_for_scripthash(pool_manager, &sh, indexer_url);
+            let pending = pending_txids_for_scripthash_with_session(
+                pool_manager,
+                &sh,
+                indexer_url,
+                Some(session),
+            );
             if !pending.is_empty() {
                 tracing::info!(
                     "Fast {} for {} ({} pool tx(s))",
@@ -970,7 +1042,12 @@ async fn handle_one_subrequest(
     if request.method == "blockchain.scripthash.subscribe" {
         if let Some(sh) = scripthash_from_params(&request.params) {
             session.subscribed_scripthashes.insert(sh.clone());
-            let pending = pending_txids_for_scripthash(pool_manager, &sh, indexer_url);
+            let pending = pending_txids_for_scripthash_with_session(
+                pool_manager,
+                &sh,
+                indexer_url,
+                Some(session),
+            );
             if !pending.is_empty() {
                 if let Some(hash) = pending::compute_modified_status_hash(vec![], &sh, &pending) {
                     tracing::info!(
@@ -1192,7 +1269,7 @@ async fn intercept_and_handle_broadcast(
     let hex_owned = hex_param;
 
     let ingest = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(12),
         tokio::task::spawn_blocking(move || {
             handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
         }),
@@ -1243,6 +1320,8 @@ async fn intercept_and_handle_broadcast(
     };
 
     tracing::info!("Broadcast ingested into pool, txid={}", result.txid);
+
+    session.recent_broadcast_txid = Some(result.txid.clone());
 
     write_json_rpc_response(
         client_stream,
@@ -1881,7 +1960,7 @@ fn handle_broadcast(
     tx_hex: &str,
     pool_manager: &Arc<PoolManager>,
     config: &Arc<Mutex<Config>>,
-    _indexer_url: &str,
+    indexer_url: &str,
     source_label: &str,
 ) -> Result<BroadcastHandleResult> {
     tracing::info!("handle_broadcast called with tx_hex length: {}", tx_hex.len());
@@ -1984,8 +2063,37 @@ fn handle_broadcast(
         output_sh
     }
 
-    // Phase 1 only before Sparrow ack; input scripthashes enriched in background after ack.
-    let scripthashes = store_pending_outputs(pool_manager, &txid, tx_hex_clean);
+    // Outputs before ack; try input scripthashes synchronously so Sparrow's post-broadcast poll succeeds.
+    let mut scripthashes = store_pending_outputs(pool_manager, &txid, tx_hex_clean);
+    let output_count = scripthashes.len();
+    let mut defer_input_enrichment = true;
+    if !indexer_url.is_empty() {
+        let indexer_addr = pending::strip_indexer_host(indexer_url);
+        let lookup = |id: &str| pool_manager.lookup_tx_hex(id);
+        match pending::enrich_input_scripthashes(
+            tx_hex_clean,
+            &indexer_addr,
+            std::time::Duration::from_secs(6),
+            Some(&lookup),
+        ) {
+            Ok(extra) if !extra.is_empty() => {
+                pool_manager.merge_pending_scripthashes(&txid, &extra);
+                scripthashes.extend(extra.iter().cloned());
+                defer_input_enrichment = false;
+                tracing::info!(
+                    "Pre-ack input scripthash enrichment for {}: {} output + {} input",
+                    txid,
+                    output_count,
+                    extra.len()
+                );
+            }
+            Ok(_) => tracing::warn!(
+                "Pre-ack input enrichment found no scripthashes for {} — session get_history fallback active",
+                txid
+            ),
+            Err(e) => tracing::warn!("Pre-ack input enrichment failed for {}: {}", txid, e),
+        }
+    }
 
     if broadcast_mode == BroadcastMode::Immediate {
         if let Err(e) = pool_manager.mark_as_due(&imported_tx.id) {
@@ -2006,7 +2114,7 @@ fn handle_broadcast(
         tx_hex: tx_hex_clean.to_string(),
         retained: true,
         affected_scripthashes: scripthashes,
-        defer_input_enrichment: true,
+        defer_input_enrichment,
     })
 }
 

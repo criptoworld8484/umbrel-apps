@@ -1084,7 +1084,7 @@ impl PoolManager {
             return;
         }
         let indexer_addr = super::virtual_mempool::strip_indexer_host(indexer_url);
-        let budget = std::time::Duration::from_millis(2500);
+        let budget = std::time::Duration::from_millis(5000);
         let lookup = |id: &str| self.lookup_tx_hex(id);
         let pending = self.get_all_pending_txs();
         for (txid, info) in pending {

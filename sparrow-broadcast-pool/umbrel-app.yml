@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.2.27"
+version: "0.2.28"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,17 +31,17 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.2.27 — Unified Sparrow connect + broadcast (fixes recurring regression loop).
+  v0.2.28 — Sparrow connects but send/broadcast failed (post-connect fix).
 
-  - headers.subscribe: 5s electrs timeout + cached chain tip fallback (never height 0)
+  - Pre-ack input scripthash enrichment (6s) so get_history on wallet inputs sees tx at height 0
 
-  - Chain tip cache warmed at startup and after Umbrel electrs reconnect
+  - Session fallback: recent broadcast tx returned for subscribed scripthashes until enrichment lands
 
-  - Removed dead legacy handler that returned fake height 0 (source of Connecting regressions)
+  - Scripthash RPC forward timeout 8s (Umbrel electrs under load was returning empty wallet / failed sends)
 
-  - On-demand input scripthash enrichment budget increased to 2.5s for post-broadcast poll
+  - Upstream get_history merge now runs on-demand enrich + session fallback
 
-  - All send modes tested: manual, timestamp MTP, by_block (scripts/test-sparrow-all.sh)
+  - v0.2.27 chain tip cache retained; disable Sparrow Tor/proxy
 developer: criptoworld8484
 website: https://github.com/criptoworld8484/umbrel-apps
 repo: https://github.com/criptoworld8484/umbrel-apps/tree/master/sparrow-broadcast-pool
