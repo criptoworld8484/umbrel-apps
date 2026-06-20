@@ -735,6 +735,23 @@ async fn forward_subrequest_sync(
     session: &mut SessionState,
     pool_manager: &PoolManager,
 ) -> Result<serde_json::Value> {
+    forward_subrequest_sync_timed(
+        request,
+        indexer_url,
+        session,
+        pool_manager,
+        std::time::Duration::from_secs(2),
+    )
+    .await
+}
+
+async fn forward_subrequest_sync_timed(
+    request: &JsonRpcRequest,
+    indexer_url: &str,
+    session: &mut SessionState,
+    pool_manager: &PoolManager,
+    timeout: std::time::Duration,
+) -> Result<serde_json::Value> {
     if is_broadcast_method(&request.method) {
         anyhow::bail!("broadcast must not be forwarded to upstream electrs");
     }
@@ -744,7 +761,7 @@ async fn forward_subrequest_sync(
     let url = indexer_url.to_string();
     let id = request.id.clone();
     let response_str = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
+        timeout,
         tokio::task::spawn_blocking(move || forward_to_indexer_sync(&raw, &url)),
     )
     .await
@@ -772,6 +789,102 @@ async fn forward_subrequest_sync(
         modify_upstream_response(&mut msg, &method, &scripthash, pool_manager, indexer_url);
     }
     Ok(msg)
+}
+
+fn parse_headers_subscribe_result(msg: &serde_json::Value) -> Option<(u64, String)> {
+    let result = msg.get("result")?;
+    let height = result.get("height")?.as_u64()?;
+    let hex = result.get("hex")?.as_str()?;
+    if height == 0 || hex.is_empty() {
+        return None;
+    }
+    Some((height, hex.to_string()))
+}
+
+pub fn warm_chain_tip_cache(indexer_url: &str, pool_manager: &PoolManager) {
+    if indexer_url.is_empty() {
+        return;
+    }
+    let req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "blockchain.headers.subscribe",
+        "params": [],
+        "id": 0
+    });
+    let raw = req.to_string();
+    let url = indexer_url.to_string();
+    if let Some(resp_str) = forward_to_indexer_sync(&raw, &url) {
+        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(resp_str.trim()) {
+            if let Some((height, hex)) = parse_headers_subscribe_result(&msg) {
+                pool_manager.cache_chain_tip(height, hex);
+                tracing::info!("Warmed chain tip cache from electrs (height={})", height);
+                return;
+            }
+        }
+    }
+    tracing::debug!("Could not warm chain tip cache from electrs");
+}
+
+async fn handle_headers_subscribe(
+    request: &JsonRpcRequest,
+    pool_manager: &Arc<PoolManager>,
+    indexer_url: &str,
+) -> Result<serde_json::Value> {
+    let id = request.id.clone();
+    if !indexer_url.is_empty() {
+        let raw = serde_json::to_string(request)?;
+        let url = indexer_url.to_string();
+        let pm = pool_manager.clone();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || forward_to_indexer_sync(&raw, &url)),
+        )
+        .await
+        {
+            Ok(Ok(Some(resp_str))) => {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(resp_str.trim()) {
+                    if let Some((height, hex)) = parse_headers_subscribe_result(&msg) {
+                        pm.cache_chain_tip(height, hex);
+                        tracing::debug!("headers.subscribe from electrs height={}", height);
+                        return Ok(msg);
+                    }
+                    if msg.get("error").is_some() {
+                        tracing::warn!(
+                            "headers.subscribe electrs error: {:?}",
+                            msg.get("error")
+                        );
+                    }
+                }
+            }
+            Ok(Ok(None)) => {
+                tracing::warn!("headers.subscribe: electrs connect failed");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("headers.subscribe task failed: {}", e);
+            }
+            Err(_) => {
+                tracing::warn!("headers.subscribe: electrs timed out (5s)");
+            }
+        }
+    }
+
+    if let Some((height, hex)) = pool_manager.get_cached_chain_tip() {
+        tracing::info!("headers.subscribe: serving cached tip height={}", height);
+        return Ok(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": { "height": height, "hex": hex },
+            "id": id
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": -32000,
+            "message": "Indexer temporarily unavailable — retry in a few seconds"
+        },
+        "id": id
+    }))
 }
 
 fn pending_txids_for_scripthash(
@@ -890,6 +1003,10 @@ async fn handle_one_subrequest(
                 }
             }
         }
+    }
+
+    if request.method == "blockchain.headers.subscribe" {
+        return handle_headers_subscribe(request, pool_manager, indexer_url).await;
     }
 
     if !indexer_url.is_empty() {
@@ -1231,6 +1348,21 @@ impl ElectrumServer {
         let pool_sparrow = self.pool_manager.clone();
         let config_sparrow = self.config.clone();
         let host_sparrow = host.clone();
+        let pool_warm = self.pool_manager.clone();
+        let config_warm = self.config.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let url = resolve_live_indexer_url(&pool_warm, &config_warm);
+            if !url.is_empty() {
+                let pm = pool_warm.clone();
+                let u = url.clone();
+                if let Err(e) =
+                    tokio::task::spawn_blocking(move || warm_chain_tip_cache(&u, &pm)).await
+                {
+                    tracing::debug!("Chain tip warm task join error: {}", e);
+                }
+            }
+        });
         tokio::spawn(async move {
             if let Err(e) =
                 run_electrum_listener(host_sparrow, port, "sparrow", pool_sparrow, config_sparrow)
@@ -1671,285 +1803,6 @@ fn parse_json_rpc(data: &[u8]) -> Result<Option<(JsonRpcRequest, usize)>> {
     }
 }
 
-async fn process_request(
-    request: JsonRpcRequest,
-    pool_manager: &Arc<PoolManager>,
-    config: &Arc<Mutex<Config>>,
-) -> serde_json::Value {
-    let id = request.id.clone();
-    tracing::debug!("Received Electrum request: method={}", request.method);
-
-    let should_forward = matches!(
-        request.method.as_str(),
-        "blockchain.scripthash.get_balance"
-            | "blockchain.scripthash.get_history"
-            | "blockchain.scripthash.listunspent"
-            | "blockchain.scripthash.subscribe"
-            | "blockchain.scripthash.get_mempool"
-            | "blockchain.transaction.get"
-            | "blockchain.transaction.get_merkle"
-            | "blockchain.block.header"
-            | "blockchain.block.headers"
-            | "blockchain.block.get_block"
-            | "blockchain.transaction.id_from_pos"
-            | "blockchain.headers.subscribe"
-            | "blockchain.numblocks.subscribe"
-    );
-
-    if should_forward {
-        let indexer_url = {
-            let cfg = config.lock().ok();
-            cfg.and_then(|c| c.indexer.as_ref().map(|i| i.url.clone()))
-        };
-
-        if let Some(indexer_url) = indexer_url {
-            let raw_request = serde_json::to_string(&request).unwrap_or_default();
-            let indexer_url_clone = indexer_url.clone();
-            let method = request.method.clone();
-            tracing::debug!("Forwarding {} to indexer at {}", method, indexer_url);
-
-            let response_str = tokio::task::spawn_blocking(move || {
-                forward_to_indexer_sync(&raw_request, &indexer_url_clone)
-            }).await.unwrap_or(None);
-
-            if let Some(response_str) = response_str {
-                tracing::debug!("Indexer response for {} (first 200 chars): {}", method, &response_str[..response_str.len().min(200)]);
-                match serde_json::from_str::<serde_json::Value>(&response_str) {
-                    Ok(val) => return val,
-                    Err(e) => {
-                        tracing::warn!("Failed to parse indexer response for {}: {}", method, e);
-                    }
-                }
-            } else {
-                tracing::warn!("Failed to connect to indexer for {}", method);
-            }
-        }
-    }
-
-    match request.method.as_str() {
-        "server.version" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": ["broadcast-pool v1.0", "1.4"],
-                "id": id
-            })
-        }
-        "server.banner" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": "broadcast-pool v1.0 - Bitcoin Transaction Pool",
-                "id": id
-            })
-        }
-        "server.ping" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": true,
-                "id": id
-            })
-        }
-        "server.features" => {
-            let genesis = {
-                config
-                    .lock()
-                    .ok()
-                    .map(|c| c.network.network_type.genesis_hash().to_string())
-                    .unwrap_or_else(|| "0000000000000000000000000000000000000000000000000000000000000000".to_string())
-            };
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": {
-                    "protocol_version": "1.4",
-                    "server_version": "broadcast-pool v1.0",
-                    "genesis_hash": genesis,
-                    "hosts": {},
-                    "protocol_max": "1.4",
-                    "protocol_min": "1.0",
-                    "settings": {},
-                    "hash_function": "sha256"
-                },
-                "id": id
-            })
-        }
-        "blockchain.transaction.broadcast" => {
-            if let Some(params) = request.params.as_ref().and_then(|p| p.as_array()) {
-                if let Some(hex_param) = params.get(0).and_then(|v| v.as_str()) {
-                    tracing::info!("broadcast request received, tx_hex length: {}", hex_param.len());
-                    match handle_broadcast(hex_param, pool_manager, config, "", "sparrow") {
-                        Ok(result) => {
-                            tracing::info!("Broadcast success, returning txid: {}", result.txid);
-                            return serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "result": result.txid,
-                                "id": id
-                            });
-                        }
-                        Err(e) => {
-                            tracing::error!("Broadcast failed: {}", e);
-                            return serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "error": {
-                                    "code": -25,
-                                    "message": e.to_string()
-                                },
-                                "id": id
-                            });
-                        }
-                    }
-                }
-            }
-
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32602,
-                    "message": "Invalid params"
-                },
-                "id": id
-            })
-        }
-        "blockchain.headers.subscribe" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": {
-                    "hex": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                    "height": 0
-                },
-                "id": id
-            })
-        }
-        "blockchain.scripthash.get_balance" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": {
-                    "confirmed": 0,
-                    "unconfirmed": 0
-                },
-                "id": id
-            })
-        }
-        "blockchain.scripthash.get_history" | "blockchain.scripthash.get_mempool" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": [],
-                "id": id
-            })
-        }
-        "blockchain.scripthash.listunspent" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": [],
-                "id": id
-            })
-        }
-        "blockchain.scripthash.subscribe" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": {
-                    "confirmed": 0,
-                    "unconfirmed": 0
-                },
-                "id": id
-            })
-        }
-        "mempool.get_fee_histogram" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": [],
-                "id": id
-            })
-        }
-        "blockchain.relayfee" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": 1.0,
-                "id": id
-            })
-        }
-        "blockchain.estimatefee" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": 10.0,
-                "id": id
-            })
-        }
-        "blockchain.util.links" | "blockchain.scripthash.get_mempool" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": [],
-                "id": id
-            })
-        }
-        "blockchain.numblocks.subscribe" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": 0,
-                "id": id
-            })
-        }
-        "blockchain.transaction.get" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": "",
-                "id": id
-            })
-        }
-        "blockchain.block.get_block" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": "",
-                "id": id
-            })
-        }
-        "blockchain.block.header" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
-                "id": id
-            })
-        }
-        "blockchain.transaction.id_from_pos" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": null,
-                "id": id
-            })
-        }
-        "server.add_peer" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": true,
-                "id": id
-            })
-        }
-        "server.peers" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": [],
-                "id": id
-            })
-        }
-        "server.history" => {
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "result": [],
-                "id": id
-            })
-        }
-        _ => {
-            tracing::warn!("Unhandled method: {}", request.method);
-            serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32601,
-                    "message": format!("Method '{}' not found", request.method)
-                },
-                "id": id
-            })
-        }
-    }
-}
-
 fn resolve_ingest_plan(
     source_label: &str,
     nlocktime: u32,
@@ -2259,6 +2112,17 @@ mod tests {
         };
         let resp = local_fast_response(&req).expect("estimatefee");
         assert!(resp.get("result").is_some());
+    }
+
+    #[test]
+    fn parse_headers_subscribe_rejects_height_zero() {
+        let zero = serde_json::json!({"result":{"height":0,"hex":"abc"}});
+        assert!(parse_headers_subscribe_result(&zero).is_none());
+        let ok = serde_json::json!({"result":{"height":100,"hex":"deadbeef"}});
+        assert_eq!(
+            parse_headers_subscribe_result(&ok),
+            Some((100, "deadbeef".to_string()))
+        );
     }
 
     #[test]

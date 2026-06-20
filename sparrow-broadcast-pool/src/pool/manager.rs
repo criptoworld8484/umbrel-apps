@@ -33,6 +33,8 @@ pub struct PoolManager {
     config: Arc<Mutex<Config>>,
     pending_txs: Arc<Mutex<HashMap<String, PendingTxInfo>>>,
     mtp_cache: Arc<Mutex<Option<(Instant, u64)>>>,
+    /// Last successful `blockchain.headers.subscribe` from electrs (height, header hex).
+    cached_chain_tip: Arc<Mutex<Option<(u64, String)>>>,
     price_feed: PriceFeed,
 }
 
@@ -50,8 +52,22 @@ impl PoolManager {
             config,
             pending_txs: Arc::new(Mutex::new(HashMap::new())),
             mtp_cache: Arc::new(Mutex::new(None)),
+            cached_chain_tip: Arc::new(Mutex::new(None)),
             price_feed: PriceFeed::new(),
         }
+    }
+
+    pub fn cache_chain_tip(&self, height: u64, hex: String) {
+        if height == 0 || hex.is_empty() {
+            return;
+        }
+        if let Ok(mut cache) = self.cached_chain_tip.lock() {
+            *cache = Some((height, hex));
+        }
+    }
+
+    pub fn get_cached_chain_tip(&self) -> Option<(u64, String)> {
+        self.cached_chain_tip.lock().ok()?.clone()
     }
 
     fn require_rpc(&self) -> Result<&BitcoinRpc> {
@@ -1068,7 +1084,7 @@ impl PoolManager {
             return;
         }
         let indexer_addr = super::virtual_mempool::strip_indexer_host(indexer_url);
-        let budget = std::time::Duration::from_millis(800);
+        let budget = std::time::Duration::from_millis(2500);
         let lookup = |id: &str| self.lookup_tx_hex(id);
         let pending = self.get_all_pending_txs();
         for (txid, info) in pending {

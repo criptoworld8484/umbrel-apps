@@ -507,6 +507,15 @@ async fn main() -> Result<()> {
                                             "Umbrel electrs connected after background retry #{}",
                                             attempt
                                         );
+                                        if let Ok(c) = cfg.lock() {
+                                            if let Some(ref idx) = c.indexer {
+                                                let url = idx.url.clone();
+                                                let pm2 = pm.clone();
+                                                std::thread::spawn(move || {
+                                                    electrum_server::warm_chain_tip_cache(&url, &pm2);
+                                                });
+                                            }
+                                        }
                                         true
                                     }
                                     Err(e) => {
