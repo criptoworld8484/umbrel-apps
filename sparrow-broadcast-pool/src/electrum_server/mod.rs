@@ -844,7 +844,7 @@ fn parse_headers_subscribe_result(msg: &serde_json::Value) -> Option<(u64, Strin
     Some((height, hex.to_string()))
 }
 
-pub fn warm_chain_tip_cache(indexer_url: &str, pool_manager: &PoolManager) {
+fn refresh_chain_tip_cache(indexer_url: &str, pool_manager: &PoolManager) {
     if indexer_url.is_empty() {
         return;
     }
@@ -860,12 +860,44 @@ pub fn warm_chain_tip_cache(indexer_url: &str, pool_manager: &PoolManager) {
         if let Ok(msg) = serde_json::from_str::<serde_json::Value>(resp_str.trim()) {
             if let Some((height, hex)) = parse_headers_subscribe_result(&msg) {
                 pool_manager.cache_chain_tip(height, hex);
-                tracing::info!("Warmed chain tip cache from electrs (height={})", height);
-                return;
+                tracing::debug!("Chain tip cache refreshed (height={})", height);
             }
         }
     }
-    tracing::debug!("Could not warm chain tip cache from electrs");
+}
+
+pub fn warm_chain_tip_cache(indexer_url: &str, pool_manager: &PoolManager) {
+    if indexer_url.is_empty() {
+        return;
+    }
+    for attempt in 1..=5 {
+        refresh_chain_tip_cache(indexer_url, pool_manager);
+        if let Some((height, _)) = pool_manager.get_cached_chain_tip() {
+            tracing::info!(
+                "Warmed chain tip cache from electrs (height={}, attempt {})",
+                height,
+                attempt
+            );
+            return;
+        }
+        if attempt < 5 {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+    }
+    tracing::warn!(
+        "Could not warm chain tip cache after 5 attempts — Sparrow Test Connection waits on electrs until cache fills"
+    );
+}
+
+fn spawn_chain_tip_refresh(indexer_url: &str, pool_manager: &Arc<PoolManager>) {
+    if indexer_url.is_empty() {
+        return;
+    }
+    let url = indexer_url.to_string();
+    let pm = pool_manager.clone();
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || refresh_chain_tip_cache(&url, &pm)).await;
+    });
 }
 
 async fn handle_headers_subscribe(
@@ -874,12 +906,24 @@ async fn handle_headers_subscribe(
     indexer_url: &str,
 ) -> Result<serde_json::Value> {
     let id = request.id.clone();
+
+    // Cache-first: Sparrow Test Connection must not block on slow Umbrel electrs.
+    if let Some((height, hex)) = pool_manager.get_cached_chain_tip() {
+        tracing::debug!("headers.subscribe instant cache hit height={}", height);
+        spawn_chain_tip_refresh(indexer_url, pool_manager);
+        return Ok(serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": { "height": height, "hex": hex },
+            "id": id
+        }));
+    }
+
     if !indexer_url.is_empty() {
         let raw = serde_json::to_string(request)?;
         let url = indexer_url.to_string();
         let pm = pool_manager.clone();
         match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(3),
             tokio::task::spawn_blocking(move || forward_to_indexer_sync(&raw, &url)),
         )
         .await
@@ -888,7 +932,7 @@ async fn handle_headers_subscribe(
                 if let Ok(msg) = serde_json::from_str::<serde_json::Value>(resp_str.trim()) {
                     if let Some((height, hex)) = parse_headers_subscribe_result(&msg) {
                         pm.cache_chain_tip(height, hex);
-                        tracing::debug!("headers.subscribe from electrs height={}", height);
+                        tracing::info!("headers.subscribe from electrs height={}", height);
                         return Ok(msg);
                     }
                     if msg.get("error").is_some() {
@@ -906,7 +950,7 @@ async fn handle_headers_subscribe(
                 tracing::warn!("headers.subscribe task failed: {}", e);
             }
             Err(_) => {
-                tracing::warn!("headers.subscribe: electrs timed out (5s)");
+                tracing::warn!("headers.subscribe: electrs timed out (3s)");
             }
         }
     }
@@ -1430,15 +1474,23 @@ impl ElectrumServer {
         let pool_warm = self.pool_manager.clone();
         let config_warm = self.config.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let url = resolve_live_indexer_url(&pool_warm, &config_warm);
-            if !url.is_empty() {
+            for attempt in 1..=30 {
+                let delay = if attempt == 1 { 1 } else { 10 };
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                let url = resolve_live_indexer_url(&pool_warm, &config_warm);
+                if url.is_empty() {
+                    continue;
+                }
                 let pm = pool_warm.clone();
                 let u = url.clone();
-                if let Err(e) =
-                    tokio::task::spawn_blocking(move || warm_chain_tip_cache(&u, &pm)).await
-                {
-                    tracing::debug!("Chain tip warm task join error: {}", e);
+                let warmed = tokio::task::spawn_blocking(move || {
+                    warm_chain_tip_cache(&u, &pm);
+                    pm.get_cached_chain_tip().is_some()
+                })
+                .await
+                .unwrap_or(false);
+                if warmed {
+                    break;
                 }
             }
         });
@@ -1588,6 +1640,30 @@ async fn process_client_line(
                         .map(|r| r.method.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    // Instant headers.subscribe when cache is warm (Sparrow Test Connection).
+    if let Ok(reqs) = parse_subrequests(line_str) {
+        if reqs.len() == 1 && reqs[0].method == "blockchain.headers.subscribe" {
+            if let Some((height, hex)) = pool_manager.get_cached_chain_tip() {
+                spawn_chain_tip_refresh(indexer_url, pool_manager);
+                write_json_rpc_response(
+                    client_stream,
+                    &serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "result": { "height": height, "hex": hex },
+                        "id": reqs[0].id
+                    }),
+                )
+                .await?;
+                tracing::info!(
+                    "Electrum RPC from {}: [blockchain.headers.subscribe] (instant cache height={})",
+                    peer_addr,
+                    height
                 );
                 return Ok(());
             }

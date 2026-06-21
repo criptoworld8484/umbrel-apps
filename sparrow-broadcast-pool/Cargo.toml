@@ -1,6 +1,6 @@
 [package]
 name = "broadcast-pool"
-version = "0.2.28"
+version = "0.2.29"
 edition = "2021"
 description = "Bitcoin Broadcast Pool - Privacy-preserving transaction scheduling and migration tool"
 license = "MIT"
