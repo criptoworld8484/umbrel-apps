@@ -1,18 +1,30 @@
 #!/bin/bash
 # Simulates Sparrow's one-RPC-per-line connect sequence (not JSON batch).
 set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 pkill -f fake-electrs.py 2>/dev/null || true
-pkill -9 -f 'cargo-target/release/broadcast-pool' 2>/dev/null || true
+pkill -9 -f 'broadcast-pool' 2>/dev/null || true
 sleep 1
-python3 /home/criptoworld/Documents/OpenCode/Mywalletcompromise/scripts/fake-electrs.py &
+TEST_DATA=$(mktemp -d)
+trap 'rm -rf "$TEST_DATA"; kill $BP $FE 2>/dev/null || true' EXIT
+python3 "$ROOT/scripts/fake-electrs.py" &
 FE=$!
 sleep 1
-BIN=/tmp/cursor-sandbox-cache/a295a663eb36fdead584f0580e3d45a4/cargo-target/release/broadcast-pool
+if [ -n "${CARGO_TARGET_DIR:-}" ] && [ -x "${CARGO_TARGET_DIR}/release/broadcast-pool" ]; then
+  BIN="${CARGO_TARGET_DIR}/release/broadcast-pool"
+elif [ -x "$ROOT/target/release/broadcast-pool" ]; then
+  BIN="$ROOT/target/release/broadcast-pool"
+else
+  echo "Build first: cargo build --release"
+  exit 1
+fi
+export BROADCAST_POOL_DATA_DIR="$TEST_DATA"
+export BROADCAST_POOL_INDEXER_URL=tcp://127.0.0.1:59999
 export BROADCAST_POOL_ELECTRUM_HOST=127.0.0.1 BROADCAST_POOL_ELECTRUM_PORT=50050
 export BROADCAST_POOL_WEB_HOST=127.0.0.1 BROADCAST_POOL_WEB_PORT=18080
 export BROADCAST_POOL_NETWORK=signet BROADCAST_POOL_UMBREL=1
 export BROADCAST_POOL_UMBREL_ELECTRS_TCP=tcp://127.0.0.1:59999
-"$BIN" start --config /home/criptoworld/Documents/OpenCode/Mywalletcompromise/config/default.toml > /tmp/bp-sparrow-lines.log 2>&1 &
+"$BIN" start --config "$ROOT/config/default.toml" > /tmp/bp-sparrow-lines.log 2>&1 &
 BP=$!
 sleep 2
 python3 -u <<'PY'
@@ -49,4 +61,17 @@ for name, req in methods:
 print("passed", ok, "of", len(methods))
 s.close()
 PY
+echo "=== nc one-liner (Sparrow line protocol) ==="
+REQ='{"jsonrpc":"2.0","method":"server.version","params":["Sparrow Wallet","1.4"],"id":99}'
+OUT=$(printf '%s\n' "$REQ" | nc -N -w 5 127.0.0.1 50050 2>&1 || true)
+if echo "$OUT" | grep -q '"result"'; then
+  echo "OK  nc server.version via -N"
+else
+  echo "FAIL nc server.version:" "$OUT"
+  exit 1
+fi
 kill $BP $FE 2>/dev/null || true
+wait $BP 2>/dev/null || true
+wait $FE 2>/dev/null || true
+fuser -k 50050/tcp 59999/tcp 18080/tcp 2>/dev/null || true
+sleep 1

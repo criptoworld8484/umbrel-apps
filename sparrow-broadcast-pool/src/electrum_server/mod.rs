@@ -9,7 +9,6 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 use crate::config::{BroadcastMode, Config};
 use crate::db::models::NewBroadcastTx;
@@ -450,22 +449,6 @@ fn scripthash_from_params(params: &Option<serde_json::Value>) -> Option<String> 
         .map(|s| s.to_string())
 }
 
-fn fetch_scripthash_history_sync(scripthash: &str, indexer_url: &str) -> Vec<serde_json::Value> {
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "blockchain.scripthash.get_history",
-        "params": [scripthash],
-        "id": 999
-    });
-    forward_to_indexer_sync(&request.to_string(), indexer_url)
-        .and_then(|resp| {
-            serde_json::from_str::<serde_json::Value>(&resp)
-                .ok()
-                .and_then(|v| v.get("result").and_then(|r| r.as_array()).cloned())
-        })
-        .unwrap_or_default()
-}
-
 fn modify_upstream_response(
     msg: &mut serde_json::Value,
     method: &str,
@@ -497,10 +480,8 @@ fn modify_upstream_response(
             if pending.is_empty() {
                 return;
             }
-            let real_history = fetch_scripthash_history_sync(scripthash, indexer_url);
-            if let Some(hash) =
-                pending::compute_modified_status_hash(real_history, scripthash, &pending)
-            {
+            // Never block the async runtime on electrs history fetch — pending-only status hash.
+            if let Some(hash) = pending::compute_modified_status_hash(vec![], scripthash, &pending) {
                 msg["result"] = serde_json::Value::String(hash);
             }
         }
@@ -535,7 +516,7 @@ fn modify_upstream_response(
 fn modify_upstream_notification(
     msg: &mut serde_json::Value,
     pool_manager: &PoolManager,
-    indexer_url: &str,
+    _indexer_url: &str,
 ) {
     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
     if method != "blockchain.scripthash.subscribe" {
@@ -551,9 +532,8 @@ fn modify_upstream_notification(
     if !pool_manager.has_pending_for_scripthash(&scripthash) {
         return;
     }
-    let real_history = fetch_scripthash_history_sync(&scripthash, indexer_url);
     let pending = pool_manager.get_pending_txids_for_scripthash(&scripthash);
-    if let Some(hash) = pending::compute_modified_status_hash(real_history, &scripthash, &pending) {
+    if let Some(hash) = pending::compute_modified_status_hash(vec![], &scripthash, &pending) {
         if params.len() > 1 {
             params[1] = serde_json::Value::String(hash);
         }
@@ -977,15 +957,8 @@ async fn handle_headers_subscribe(
 fn pending_txids_for_scripthash(
     pool_manager: &PoolManager,
     scripthash: &str,
-    indexer_url: &str,
-    skip_enrich: bool,
 ) -> Vec<String> {
-    let mut pending = pool_manager.get_pending_txids_for_scripthash(scripthash);
-    if !skip_enrich && pending.is_empty() && pool_manager.has_pending_txs() {
-        pool_manager.enrich_pending_for_scripthash(scripthash, indexer_url);
-        pending = pool_manager.get_pending_txids_for_scripthash(scripthash);
-    }
-    pending
+    pool_manager.get_pending_txids_for_scripthash(scripthash)
 }
 
 fn pending_txids_for_scripthash_with_session(
@@ -1012,7 +985,7 @@ fn pending_txids_for_scripthash_with_session(
             return pending;
         }
     }
-    pending_txids_for_scripthash(pool_manager, scripthash, indexer_url, false)
+    pending_txids_for_scripthash(pool_manager, scripthash)
 }
 
 fn build_scripthash_mempool_result(
@@ -1227,10 +1200,8 @@ async fn notify_subscribed_pending_mempool(
     subscribed: &HashSet<String>,
     pool_manager: &PoolManager,
     txid_hint: &str,
-    indexer_url: &str,
 ) -> Result<()> {
     for sh in subscribed {
-        pool_manager.enrich_pending_for_scripthash(sh, indexer_url);
         let mut pending = pool_manager.get_pending_txids_for_scripthash(sh);
         if !pending.iter().any(|t| t == txid_hint) {
             pending.push(txid_hint.to_string());
@@ -1338,68 +1309,47 @@ async fn intercept_and_handle_broadcast(
     .await?;
     tracing::info!("Broadcast ack sent to wallet (pre-ingest), txid={}", preview.txid);
 
-    // Invariant 4: ingest after ack — DB + output scripthashes only.
+    // Ingest in background — never block read loop or tokio workers (avoids accept starvation).
     let pm = pool_manager.clone();
     let cfg = config.clone();
     let src = source_label.to_string();
     let hex_owned = hex_param;
+    let preview_txid = preview.txid.clone();
 
-    let ingest = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || {
-            handle_broadcast(&hex_owned, &pm, &cfg, &src)
-        }),
-    )
-    .await;
-
-    let result = match ingest {
-        Ok(Ok(Ok(result))) => result,
-        Ok(Ok(Err(e))) => {
-            session.recent_broadcast_txid = None;
-            tracing::error!("Broadcast ingest failed for {}: {}", preview.txid, e);
-            return Ok(());
-        }
-        Err(_) => {
-            session.recent_broadcast_txid = None;
-            tracing::error!("Broadcast ingest timed out for {}", preview.txid);
-            return Ok(());
-        }
-        Ok(Err(e)) => {
-            session.recent_broadcast_txid = None;
-            tracing::error!("Broadcast ingest task failed for {}: {}", preview.txid, e);
-            return Ok(());
-        }
-    };
-
-    tracing::info!("Broadcast ingested into pool, txid={}", result.txid);
-
-    if result.retained {
-        if session.subscribed_scripthashes.is_empty() {
-            tracing::warn!(
-                "Broadcast ingested but no scripthash subscriptions on this session — Sparrow mempool poll relies on fast get_history"
-            );
-        }
-        if let Err(e) = notify_subscribed_pending_mempool(
-            client_stream,
-            &session.subscribed_scripthashes,
-            pool_manager,
-            &result.txid,
-            indexer_url,
-        )
-        .await
-        {
-            tracing::warn!("Post-broadcast mempool notify failed: {}", e);
-        }
-        if result.defer_input_enrichment {
-            let pm = pool_manager.clone();
-            let url = indexer_url.to_string();
-            let txid = result.txid.clone();
-            let hex = result.tx_hex.clone();
+    tokio::spawn(async move {
+        let pm_enrich = pm.clone();
+        let ingest = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
             tokio::task::spawn_blocking(move || {
-                enrich_pending_input_scripthashes(&pm, &txid, &hex, &url);
-            });
+                handle_broadcast(&hex_owned, &pm, &cfg, &src)
+            }),
+        )
+        .await;
+
+        match ingest {
+            Ok(Ok(Ok(result))) => {
+                tracing::info!("Broadcast ingested into pool, txid={}", result.txid);
+                if result.defer_input_enrichment {
+                    let url = pm_enrich.get_indexer_url().unwrap_or_default();
+                    let txid = result.txid.clone();
+                    let hex = result.tx_hex.clone();
+                    tokio::task::spawn_blocking(move || {
+                        enrich_pending_input_scripthashes(&pm_enrich, &txid, &hex, &url);
+                    });
+                }
+            }
+            Ok(Ok(Err(e))) => {
+                tracing::error!("Broadcast ingest failed for {}: {}", preview_txid, e);
+            }
+            Err(_) => {
+                tracing::error!("Broadcast ingest timed out for {}", preview_txid);
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Broadcast ingest task failed for {}: {}", preview_txid, e);
+            }
         }
-    }
+    });
+
     Ok(())
 }
 
@@ -1537,42 +1487,123 @@ async fn run_electrum_listener(
     config: Arc<Mutex<Config>>,
 ) -> Result<()> {
     let addr = format!("{}:{}", host, port);
-    let listener = TcpListener::bind(&addr).await?;
-    tracing::info!("Electrum listener [{}] bound on {}", source_label, addr);
+    let (conn_tx, mut conn_rx) =
+        tokio::sync::mpsc::channel::<(std::net::TcpStream, std::net::SocketAddr)>(64);
 
+    let accept_addr = addr.clone();
+    let accept_label = source_label;
+    let version = env!("CARGO_PKG_VERSION").to_string();
+
+    std::thread::Builder::new()
+        .name(format!("electrum-accept-{source_label}"))
+        .spawn(move || run_electrum_accept_thread(accept_addr, accept_label, version, conn_tx))
+        .map_err(|e| anyhow::anyhow!("spawn electrum accept thread: {}", e))?;
+
+    tracing::info!(
+        "Electrum accept dispatcher [{}] ready on {} (v{})",
+        source_label,
+        addr,
+        env!("CARGO_PKG_VERSION")
+    );
+
+    while let Some((std_stream, peer_addr)) = conn_rx.recv().await {
+        let client_stream = match tokio::net::TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("TcpStream::from_std failed for {}: {}", peer_addr, e);
+                continue;
+            }
+        };
+        tracing::info!(
+            "Electrum client connected from {} [{}] (broadcast-pool v{})",
+            peer_addr,
+            source_label,
+            env!("CARGO_PKG_VERSION")
+        );
+        if source_label == "sparrow" {
+            tracing::warn!(
+                "Sparrow [{}]: disable Tor proxy in Settings→Network or broadcasts bypass this pool (mempool.space) and txs never appear here",
+                peer_addr
+            );
+        }
+        let pool_manager = pool_manager.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(
+                pool_manager,
+                config,
+                client_stream,
+                peer_addr,
+                source_label,
+            )
+            .await
+            {
+                tracing::error!("Connection error ({}): {}", source_label, e);
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn set_tcp_keepalive(stream: &std::net::TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(60))
+        .with_interval(std::time::Duration::from_secs(10));
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
+}
+
+fn run_electrum_accept_thread(
+    addr: String,
+    source_label: &'static str,
+    version: String,
+    conn_tx: tokio::sync::mpsc::Sender<(std::net::TcpStream, std::net::SocketAddr)>,
+) {
+    let listener = match std::net::TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(
+                "Electrum bind failed [{}] {}: {}",
+                source_label,
+                addr,
+                e
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        "Electrum listener [{}] bound on {} (dedicated accept thread v{})",
+        source_label,
+        addr,
+        version
+    );
+    listener.set_nonblocking(true).ok();
+    let mut last_heartbeat = std::time::Instant::now();
     loop {
-        match listener.accept().await {
-            Ok((client_stream, peer_addr)) => {
+        if last_heartbeat.elapsed() >= std::time::Duration::from_secs(60) {
+            tracing::info!("Electrum accept thread alive [{}]", source_label);
+            last_heartbeat = std::time::Instant::now();
+        }
+        match listener.accept() {
+            Ok((stream, peer)) => {
                 tracing::info!(
-                    "Electrum client connected from {} [{}] (broadcast-pool v{})",
-                    peer_addr,
+                    "TCP accepted from {} [{}] (v{}, pre-dispatch)",
+                    peer,
                     source_label,
-                    env!("CARGO_PKG_VERSION")
+                    version
                 );
-                if source_label == "sparrow" {
-                    tracing::warn!(
-                        "Sparrow [{}]: disable Tor proxy in Settings→Network or broadcasts bypass this pool (mempool.space) and txs never appear here",
-                        peer_addr
-                    );
+                set_tcp_keepalive(&stream);
+                if conn_tx.blocking_send((stream, peer)).is_err() {
+                    tracing::warn!("Electrum accept channel closed [{}]", source_label);
+                    break;
                 }
-                let pool_manager = pool_manager.clone();
-                let config = config.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_connection(
-                        pool_manager,
-                        config,
-                        client_stream,
-                        peer_addr,
-                        source_label,
-                    )
-                    .await
-                    {
-                        tracing::error!("Connection error ({}): {}", source_label, e);
-                    }
-                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(e) => {
                 tracing::error!("Failed to accept connection ({}): {}", source_label, e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }

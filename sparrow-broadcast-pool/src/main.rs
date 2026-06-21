@@ -257,7 +257,7 @@ enum MigrateCommands {
     },
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> Result<()> {
     // Install rustls crypto provider once (avoids race condition in SSL connections)
     let _ = rustls::crypto::ring::default_provider().install_default();
