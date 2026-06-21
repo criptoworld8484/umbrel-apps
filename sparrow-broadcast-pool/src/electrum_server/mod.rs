@@ -996,6 +996,7 @@ fn pending_txids_for_scripthash_with_session(
     let mut pending = pending_txids_for_scripthash(pool_manager, scripthash, indexer_url);
     if let Some(session) = session {
         if let Some(ref txid) = session.recent_broadcast_txid {
+            // Invariant 5: Sparrow polls subscribed INPUT scripthashes immediately after ack.
             if session.subscribed_scripthashes.contains(scripthash)
                 && !pending.iter().any(|t| t == txid)
             {
@@ -1009,6 +1010,13 @@ fn pending_txids_for_scripthash_with_session(
         }
     }
     pending
+}
+
+/// Track wallet scripthashes Sparrow cares about (subscribe + post-broadcast poll).
+fn track_scripthash_interest(session: &mut SessionState, scripthash: &str) {
+    if !scripthash.is_empty() {
+        session.subscribed_scripthashes.insert(scripthash.to_string());
+    }
 }
 
 async fn handle_one_subrequest(
@@ -1047,6 +1055,7 @@ async fn handle_one_subrequest(
         || request.method == "blockchain.scripthash.get_mempool"
     {
         if let Some(sh) = scripthash_from_params(&request.params) {
+            track_scripthash_interest(session, &sh);
             let pending = pending_txids_for_scripthash_with_session(
                 pool_manager,
                 &sh,
@@ -1085,7 +1094,7 @@ async fn handle_one_subrequest(
 
     if request.method == "blockchain.scripthash.subscribe" {
         if let Some(sh) = scripthash_from_params(&request.params) {
-            session.subscribed_scripthashes.insert(sh.clone());
+            track_scripthash_interest(session, &sh);
             let pending = pending_txids_for_scripthash_with_session(
                 pool_manager,
                 &sh,
@@ -1212,9 +1221,9 @@ async fn notify_subscribed_pending_mempool(
 ) -> Result<()> {
     for sh in subscribed {
         pool_manager.enrich_pending_for_scripthash(sh, indexer_url);
-        let pending = pool_manager.get_pending_txids_for_scripthash(sh);
-        if pending.is_empty() || !pending.iter().any(|t| t == txid_hint) {
-            continue;
+        let mut pending = pool_manager.get_pending_txids_for_scripthash(sh);
+        if !pending.iter().any(|t| t == txid_hint) {
+            pending.push(txid_hint.to_string());
         }
         let Some(hash) = pending::compute_modified_status_hash(vec![], sh, &pending) else {
             continue;
@@ -1305,17 +1314,19 @@ async fn intercept_and_handle_broadcast(
         }
     };
 
-    // Ingest before ack: Sparrow polls get_history immediately after txid and expects height 0.
+    // Invariant 5: session fallback active before ingest completes (Sparrow polls immediately after ack).
+    session.recent_broadcast_txid = Some(preview.txid.clone());
+
+    // Invariant 4: ingest = DB + output scripthashes only; never block ack on electrs.
     let pm = pool_manager.clone();
     let cfg = config.clone();
-    let url = indexer_url.to_string();
     let src = source_label.to_string();
     let hex_owned = hex_param;
 
     let ingest = tokio::time::timeout(
-        std::time::Duration::from_secs(12),
+        std::time::Duration::from_secs(5),
         tokio::task::spawn_blocking(move || {
-            handle_broadcast(&hex_owned, &pm, &cfg, &url, &src)
+            handle_broadcast(&hex_owned, &pm, &cfg, &src)
         }),
     )
     .await;
@@ -1364,8 +1375,6 @@ async fn intercept_and_handle_broadcast(
     };
 
     tracing::info!("Broadcast ingested into pool, txid={}", result.txid);
-
-    session.recent_broadcast_txid = Some(result.txid.clone());
 
     write_json_rpc_response(
         client_stream,
@@ -2036,7 +2045,6 @@ fn handle_broadcast(
     tx_hex: &str,
     pool_manager: &Arc<PoolManager>,
     config: &Arc<Mutex<Config>>,
-    indexer_url: &str,
     source_label: &str,
 ) -> Result<BroadcastHandleResult> {
     tracing::info!("handle_broadcast called with tx_hex length: {}", tx_hex.len());
@@ -2139,37 +2147,8 @@ fn handle_broadcast(
         output_sh
     }
 
-    // Outputs before ack; try input scripthashes synchronously so Sparrow's post-broadcast poll succeeds.
-    let mut scripthashes = store_pending_outputs(pool_manager, &txid, tx_hex_clean);
-    let output_count = scripthashes.len();
-    let mut defer_input_enrichment = true;
-    if !indexer_url.is_empty() {
-        let indexer_addr = pending::strip_indexer_host(indexer_url);
-        let lookup = |id: &str| pool_manager.lookup_tx_hex(id);
-        match pending::enrich_input_scripthashes(
-            tx_hex_clean,
-            &indexer_addr,
-            std::time::Duration::from_secs(6),
-            Some(&lookup),
-        ) {
-            Ok(extra) if !extra.is_empty() => {
-                pool_manager.merge_pending_scripthashes(&txid, &extra);
-                scripthashes.extend(extra.iter().cloned());
-                defer_input_enrichment = false;
-                tracing::info!(
-                    "Pre-ack input scripthash enrichment for {}: {} output + {} input",
-                    txid,
-                    output_count,
-                    extra.len()
-                );
-            }
-            Ok(_) => tracing::warn!(
-                "Pre-ack input enrichment found no scripthashes for {} — session get_history fallback active",
-                txid
-            ),
-            Err(e) => tracing::warn!("Pre-ack input enrichment failed for {}: {}", txid, e),
-        }
-    }
+    // Invariant 4: outputs-only before Sparrow ack; input enrichment runs in background after ack.
+    let scripthashes = store_pending_outputs(pool_manager, &txid, tx_hex_clean);
 
     if broadcast_mode == BroadcastMode::Immediate {
         if let Err(e) = pool_manager.mark_as_due(&imported_tx.id) {
@@ -2190,7 +2169,7 @@ fn handle_broadcast(
         tx_hex: tx_hex_clean.to_string(),
         retained: true,
         affected_scripthashes: scripthashes,
-        defer_input_enrichment,
+        defer_input_enrichment: true,
     })
 }
 

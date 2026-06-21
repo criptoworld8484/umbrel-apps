@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.2.29"
+version: "0.3.0"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,13 +31,15 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.2.29 — Fix Sparrow Test Connection stuck on Connecting.
+  v0.3.0 — Unified Sparrow connect + broadcast (breaks the regression loop).
 
-  - headers.subscribe answers instantly from chain tip cache (no 3–5s electrs wait)
+  Connect: headers.subscribe instant from cache; never height 0; works if electrs is down
 
-  - Cache warmed on startup with retries; background refresh after each cached response
+  Broadcast: ack in <2s (DB + outputs only); never blocks on electrs before txid
 
-  - v0.2.28 send fixes retained (pre-ack input enrichment, session get_history fallback)
+  Post-broadcast: session fallback + fast get_history on subscribed scripthashes; background input enrich
+
+  All modes: manual, timestamp MTP, by_block, immediate — see scripts/test-sparrow-full.sh
 developer: criptoworld8484
 website: https://github.com/criptoworld8484/umbrel-apps
 repo: https://github.com/criptoworld8484/umbrel-apps/tree/master/sparrow-broadcast-pool
