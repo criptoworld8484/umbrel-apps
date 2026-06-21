@@ -978,9 +978,10 @@ fn pending_txids_for_scripthash(
     pool_manager: &PoolManager,
     scripthash: &str,
     indexer_url: &str,
+    skip_enrich: bool,
 ) -> Vec<String> {
     let mut pending = pool_manager.get_pending_txids_for_scripthash(scripthash);
-    if pending.is_empty() && pool_manager.has_pending_txs() {
+    if !skip_enrich && pending.is_empty() && pool_manager.has_pending_txs() {
         pool_manager.enrich_pending_for_scripthash(scripthash, indexer_url);
         pending = pool_manager.get_pending_txids_for_scripthash(scripthash);
     }
@@ -993,23 +994,45 @@ fn pending_txids_for_scripthash_with_session(
     indexer_url: &str,
     session: Option<&SessionState>,
 ) -> Vec<String> {
-    let mut pending = pending_txids_for_scripthash(pool_manager, scripthash, indexer_url);
     if let Some(session) = session {
         if let Some(ref txid) = session.recent_broadcast_txid {
-            // Invariant 5: Sparrow polls subscribed INPUT scripthashes immediately after ack.
-            if session.subscribed_scripthashes.contains(scripthash)
-                && !pending.iter().any(|t| t == txid)
-            {
-                tracing::info!(
-                    "Session fallback for {} → tx {}",
-                    &scripthash[..scripthash.len().min(16)],
-                    &txid[..txid.len().min(16)]
-                );
-                pending.push(txid.clone());
+            // Sparrow polls INPUT scripthashes right after ack — always include pending broadcast.
+            let mut pending = vec![txid.clone()];
+            for t in pool_manager.get_pending_txids_for_scripthash(scripthash) {
+                if !pending.iter().any(|p| p == &t) {
+                    pending.push(t);
+                }
             }
+            tracing::info!(
+                "Session broadcast poll {} → tx {} ({} total)",
+                &scripthash[..scripthash.len().min(16)],
+                &txid[..txid.len().min(16)],
+                pending.len()
+            );
+            return pending;
         }
     }
-    pending
+    pending_txids_for_scripthash(pool_manager, scripthash, indexer_url, false)
+}
+
+fn build_scripthash_mempool_result(
+    method: &str,
+    pending: &[String],
+) -> serde_json::Value {
+    if method == "blockchain.scripthash.get_mempool" {
+        pending::inject_get_mempool(serde_json::json!([0, []]), pending)
+    } else {
+        pending
+            .iter()
+            .map(|txid| {
+                serde_json::json!({
+                    "tx_hash": txid,
+                    "height": 0
+                })
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
 }
 
 /// Track wallet scripthashes Sparrow cares about (subscribe + post-broadcast poll).
@@ -1050,7 +1073,7 @@ async fn handle_one_subrequest(
         }));
     }
 
-    // Sparrow polls get_history/get_mempool after broadcast — never block on electrs when pool has txs.
+    // Sparrow polls get_history/get_mempool after broadcast — never block on electrs.
     if request.method == "blockchain.scripthash.get_history"
         || request.method == "blockchain.scripthash.get_mempool"
     {
@@ -1069,20 +1092,7 @@ async fn handle_one_subrequest(
                     &sh[..sh.len().min(16)],
                     pending.len()
                 );
-                let result = if request.method == "blockchain.scripthash.get_mempool" {
-                    pending::inject_get_mempool(serde_json::json!([0, []]), &pending)
-                } else {
-                    let history: Vec<serde_json::Value> = pending
-                        .iter()
-                        .map(|txid| {
-                            serde_json::json!({
-                                "tx_hash": txid,
-                                "height": 0
-                            })
-                        })
-                        .collect();
-                    serde_json::Value::Array(history)
-                };
+                let result = build_scripthash_mempool_result(&request.method, &pending);
                 return Ok(serde_json::json!({
                     "jsonrpc": "2.0",
                     "result": result,
@@ -1314,10 +1324,21 @@ async fn intercept_and_handle_broadcast(
         }
     };
 
-    // Invariant 5: session fallback active before ingest completes (Sparrow polls immediately after ack).
+    // Invariant 5: Sparrow polls immediately after ack — set before ack, never wait on ingest.
     session.recent_broadcast_txid = Some(preview.txid.clone());
 
-    // Invariant 4: ingest = DB + output scripthashes only; never block ack on electrs.
+    write_json_rpc_response(
+        client_stream,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": preview.txid,
+            "id": id
+        }),
+    )
+    .await?;
+    tracing::info!("Broadcast ack sent to wallet (pre-ingest), txid={}", preview.txid);
+
+    // Invariant 4: ingest after ack — DB + output scripthashes only.
     let pm = pool_manager.clone();
     let cfg = config.clone();
     let src = source_label.to_string();
@@ -1334,58 +1355,23 @@ async fn intercept_and_handle_broadcast(
     let result = match ingest {
         Ok(Ok(Ok(result))) => result,
         Ok(Ok(Err(e))) => {
+            session.recent_broadcast_txid = None;
             tracing::error!("Broadcast ingest failed for {}: {}", preview.txid, e);
-            write_json_rpc_response(
-                client_stream,
-                &serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "error": { "code": -25, "message": e.to_string() },
-                    "id": id
-                }),
-            )
-            .await?;
             return Ok(());
         }
         Err(_) => {
+            session.recent_broadcast_txid = None;
             tracing::error!("Broadcast ingest timed out for {}", preview.txid);
-            write_json_rpc_response(
-                client_stream,
-                &serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "error": { "code": -25, "message": "Broadcast ingest timed out — check electrs connection" },
-                    "id": id
-                }),
-            )
-            .await?;
             return Ok(());
         }
         Ok(Err(e)) => {
+            session.recent_broadcast_txid = None;
             tracing::error!("Broadcast ingest task failed for {}: {}", preview.txid, e);
-            write_json_rpc_response(
-                client_stream,
-                &serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "error": { "code": -25, "message": e.to_string() },
-                    "id": id
-                }),
-            )
-            .await?;
             return Ok(());
         }
     };
 
     tracing::info!("Broadcast ingested into pool, txid={}", result.txid);
-
-    write_json_rpc_response(
-        client_stream,
-        &serde_json::json!({
-            "jsonrpc": "2.0",
-            "result": result.txid,
-            "id": id
-        }),
-    )
-    .await?;
-    tracing::info!("Broadcast ack sent to wallet, txid={}", result.txid);
 
     if result.retained {
         if session.subscribed_scripthashes.is_empty() {

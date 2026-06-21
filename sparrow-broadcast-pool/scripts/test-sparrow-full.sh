@@ -134,8 +134,55 @@ TS = SAMPLE_TX[:-8] + format(1750000000, '08x')
 run_mode("timestamp", TS)
 BH = SAMPLE_TX[:-8] + format(900000, '08x')
 run_mode("by_block", BH)
+
+# Output scripthash subscribe + by_block (real Sparrow change output path)
+def output_sh():
+    import hashlib
+    script = bytes.fromhex("76a914ffb035781c3c69e076d48b60c3d38592e7ce06a788ac")
+    return hashlib.sha256(script).digest()[::-1].hex()
+
+def run_output_subscribe_by_block():
+    sh = output_sh()
+    tx = BH
+    s = socket.create_connection(("127.0.0.1", 50050), timeout=3)
+    s.settimeout(10)
+    for req in [
+        {"jsonrpc":"2.0","method":"server.version","params":["Sparrow Wallet","1.4"],"id":10},
+        {"jsonrpc":"2.0","method":"blockchain.scripthash.subscribe","params":[sh],"id":11},
+        {"jsonrpc":"2.0","method":"blockchain.transaction.broadcast","params":tx,"id":12},
+    ]:
+        s.sendall((json.dumps(req)+"\n").encode())
+        resp = read_line(s)
+        if "broadcast" in json.dumps(req):
+            txid = resp["result"]
+    s.sendall((json.dumps({"jsonrpc":"2.0","method":"blockchain.scripthash.get_history","params":[sh],"id":13})+"\n").encode())
+    hist = read_line(s)
+    if not any(e.get("height")==0 and e.get("tx_hash")==txid for e in hist.get("result",[])):
+        print("FAIL by_block output subscribe", hist); sys.exit(1)
+    print("PASS by_block: output scripthash subscribe + get_history")
+    s.close()
+
+run_output_subscribe_by_block()
+
+# Session fallback only — no subscribe before broadcast
+def run_fallback_only():
+    sh = "deadbeef" * 4
+    tx = BH
+    s = socket.create_connection(("127.0.0.1", 50050), timeout=3)
+    s.settimeout(10)
+    s.sendall((json.dumps({"jsonrpc":"2.0","method":"blockchain.transaction.broadcast","params":tx,"id":20})+"\n").encode())
+    resp = read_line(s)
+    txid = resp["result"]
+    s.sendall((json.dumps({"jsonrpc":"2.0","method":"blockchain.scripthash.get_history","params":[sh],"id":21})+"\n").encode())
+    hist = read_line(s)
+    if not any(e.get("height")==0 and e.get("tx_hash")==txid for e in hist.get("result",[])):
+        print("FAIL session fallback only", hist); sys.exit(1)
+    print("PASS session fallback without prior subscribe")
+    s.close()
+
+run_fallback_only()
 PY
 
-grep -q "Session fallback" /tmp/bp-sparrow-full.log && echo "PASS: session fallback logged"
+grep -q "Session broadcast poll" /tmp/bp-sparrow-full.log && echo "PASS: session broadcast poll logged"
 grep -q "INTERCEPTED broadcast RPC" /tmp/bp-sparrow-full.log && echo "PASS: broadcasts intercepted"
 echo "ALL FULL SPARROW TESTS PASSED"
