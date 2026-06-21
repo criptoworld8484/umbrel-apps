@@ -339,8 +339,6 @@ struct BroadcastHandleResult {
     tx_hex: String,
     retained: bool,
     affected_scripthashes: Vec<String>,
-    /// Input scripthash enrichment deferred until after Sparrow ack (electrs can be slow on Umbrel).
-    defer_input_enrichment: bool,
 }
 
 struct SessionState {
@@ -1295,7 +1293,29 @@ async fn intercept_and_handle_broadcast(
         }
     };
 
-    // Invariant 5: Sparrow polls immediately after ack — set before ack, never wait on ingest.
+    // ── Phase 1: Store output scripthashes SYNCHRONOUSLY before ack ──
+    // Sparrow polls immediately after ack — the tx must be visible in the
+    // virtual mempool the instant the ack is sent, otherwise Sparrow stays
+    // stuck in "broadcasting" forever.
+    let output_sh = pending::extract_affected_scripthashes_opts(&hex_param, "", true)
+        .unwrap_or_default();
+    let outputs: Vec<PendingTxOutput> = pending::extract_outputs(&hex_param)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(output_index, value, scripthash)| PendingTxOutput {
+            output_index,
+            value,
+            scripthash,
+        })
+        .collect();
+    pool_manager.store_pending_tx(&preview.txid, &hex_param, output_sh.clone(), outputs);
+    tracing::info!(
+        "Pre-ack virtual mempool: txid={} stored with {} output scripthashes",
+        preview.txid,
+        output_sh.len()
+    );
+
+    // Invariant 5: Sparrow polls immediately after ack — set before ack.
     session.recent_broadcast_txid = Some(preview.txid.clone());
 
     write_json_rpc_response(
@@ -1307,9 +1327,9 @@ async fn intercept_and_handle_broadcast(
         }),
     )
     .await?;
-    tracing::info!("Broadcast ack sent to wallet (pre-ingest), txid={}", preview.txid);
+    tracing::info!("Broadcast ack sent to wallet (outputs pre-stored), txid={}", preview.txid);
 
-    // Ingest in background — never block read loop or tokio workers (avoids accept starvation).
+    // ── Phase 2: DB insert + input scripthash enrichment in background ──
     let pm = pool_manager.clone();
     let cfg = config.clone();
     let src = source_label.to_string();
@@ -1319,7 +1339,7 @@ async fn intercept_and_handle_broadcast(
     tokio::spawn(async move {
         let pm_enrich = pm.clone();
         let ingest = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(10),
             tokio::task::spawn_blocking(move || {
                 handle_broadcast(&hex_owned, &pm, &cfg, &src)
             }),
@@ -1329,14 +1349,12 @@ async fn intercept_and_handle_broadcast(
         match ingest {
             Ok(Ok(Ok(result))) => {
                 tracing::info!("Broadcast ingested into pool, txid={}", result.txid);
-                if result.defer_input_enrichment {
-                    let url = pm_enrich.get_indexer_url().unwrap_or_default();
-                    let txid = result.txid.clone();
-                    let hex = result.tx_hex.clone();
-                    tokio::task::spawn_blocking(move || {
-                        enrich_pending_input_scripthashes(&pm_enrich, &txid, &hex, &url);
-                    });
-                }
+                let url = pm_enrich.get_indexer_url().unwrap_or_default();
+                let txid = result.txid.clone();
+                let hex = result.tx_hex.clone();
+                tokio::task::spawn_blocking(move || {
+                    enrich_pending_input_scripthashes(&pm_enrich, &txid, &hex, &url);
+                });
             }
             Ok(Ok(Err(e))) => {
                 tracing::error!("Broadcast ingest failed for {}: {}", preview_txid, e);
@@ -2186,7 +2204,6 @@ fn handle_broadcast(
         tx_hex: tx_hex_clean.to_string(),
         retained: true,
         affected_scripthashes: scripthashes,
-        defer_input_enrichment: true,
     })
 }
 
