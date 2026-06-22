@@ -1904,41 +1904,77 @@ async fn handle_connection(
 
     let mut client_buf = Vec::new();
     let mut session = SessionState::new();
+    let mut scripthash_rx = pool_manager.subscribe_scripthash_changes();
 
     loop {
-        let n = client_stream.read_buf(&mut client_buf).await?;
-        if n == 0 {
-            session.log_disconnect_summary(peer_addr, source_label);
-            break;
-        }
-        while let Some((line_bytes, line_str)) = pop_client_line(&mut client_buf) {
-            let indexer_url = resolve_live_indexer_url(&pool_manager, &config);
+        tokio::select! {
+            result = client_stream.read_buf(&mut client_buf) => {
+                let n = result?;
+                if n == 0 {
+                    session.log_disconnect_summary(peer_addr, source_label);
+                    break;
+                }
+                while let Some((line_bytes, line_str)) = pop_client_line(&mut client_buf) {
+                    let indexer_url = resolve_live_indexer_url(&pool_manager, &config);
 
-            process_client_line(
-                &line_bytes,
-                &line_str,
-                peer_addr,
-                &pool_manager,
-                &config,
-                &indexer_url,
-                &mut indexer_stream,
-                &mut session,
-                source_label,
-                &mut client_stream,
-            )
-            .await?;
-        }
+                    process_client_line(
+                        &line_bytes,
+                        &line_str,
+                        peer_addr,
+                        &pool_manager,
+                        &config,
+                        &indexer_url,
+                        &mut indexer_stream,
+                        &mut session,
+                        source_label,
+                        &mut client_stream,
+                    )
+                    .await?;
+                }
 
-        if !client_buf.is_empty() && client_buf.len() >= 4096 {
-            let preview = String::from_utf8_lossy(&client_buf[..client_buf.len().min(120)]);
-            if line_mentions_tx_rpc(&preview) || preview.contains("method") {
-                tracing::warn!(
-                    "Electrum client {} [{}] buffered {} bytes without newline (preview={})",
-                    peer_addr,
-                    source_label,
-                    client_buf.len(),
-                    preview
-                );
+                if !client_buf.is_empty() && client_buf.len() >= 4096 {
+                    let preview = String::from_utf8_lossy(&client_buf[..client_buf.len().min(120)]);
+                    if line_mentions_tx_rpc(&preview) || preview.contains("method") {
+                        tracing::warn!(
+                            "Electrum client {} [{}] buffered {} bytes without newline (preview={})",
+                            peer_addr,
+                            source_label,
+                            client_buf.len(),
+                            preview
+                        );
+                    }
+                }
+            }
+            Ok(notification) = scripthash_rx.recv() => {
+                if session.subscribed_scripthashes.contains(&notification.scripthash) {
+                    let indexer_url = resolve_live_indexer_url(&pool_manager, &config);
+                    let pending = pending_txids_for_scripthash_with_session(
+                        &pool_manager,
+                        &notification.scripthash,
+                        &indexer_url,
+                        Some(&session),
+                    );
+                    if let Some(hash) = pending::compute_modified_status_hash(vec![], &notification.scripthash, &pending) {
+                        let notification_json = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "method": "blockchain.scripthash.subscribe",
+                            "params": [notification.scripthash, hash]
+                        });
+                        if let Ok(payload) = serde_json::to_vec(&notification_json) {
+                            let mut out = payload;
+                            out.push(b'\n');
+                            if client_stream.write_all(&out).await.is_ok() {
+                                let _ = client_stream.flush().await;
+                                tracing::info!(
+                                    "Push notification for scripthash {} ({} pending) to {}",
+                                    &notification.scripthash[..notification.scripthash.len().min(16)],
+                                    pending.len(),
+                                    peer_addr
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }

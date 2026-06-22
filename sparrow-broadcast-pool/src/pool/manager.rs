@@ -26,6 +26,12 @@ pub struct PendingTxInfo {
     pub outputs: Vec<PendingTxOutput>,
 }
 
+/// Notification sent when scripthash status changes in the virtual mempool.
+#[derive(Clone, Debug)]
+pub struct ScripthashNotification {
+    pub scripthash: String,
+}
+
 pub struct PoolManager {
     db: Arc<Database>,
     rpc: Option<Arc<BitcoinRpc>>,
@@ -36,6 +42,8 @@ pub struct PoolManager {
     /// Last successful `blockchain.headers.subscribe` from electrs (height, header hex).
     cached_chain_tip: Arc<Mutex<Option<(u64, String)>>>,
     price_feed: PriceFeed,
+    /// Broadcast channel for scripthash state changes (virtual mempool add/remove).
+    scripthash_notifications: tokio::sync::broadcast::Sender<ScripthashNotification>,
 }
 
 impl PoolManager {
@@ -45,6 +53,7 @@ impl PoolManager {
         indexer: Option<Arc<ElectrumClient>>,
         config: Arc<Mutex<Config>>,
     ) -> Self {
+        let (scripthash_notifications, _) = tokio::sync::broadcast::channel(256);
         Self {
             db,
             rpc,
@@ -54,7 +63,13 @@ impl PoolManager {
             mtp_cache: Arc::new(Mutex::new(None)),
             cached_chain_tip: Arc::new(Mutex::new(None)),
             price_feed: PriceFeed::new(),
+            scripthash_notifications,
         }
+    }
+
+    /// Subscribe to scripthash state change notifications.
+    pub fn subscribe_scripthash_changes(&self) -> tokio::sync::broadcast::Receiver<ScripthashNotification> {
+        self.scripthash_notifications.subscribe()
     }
 
     pub fn cache_chain_tip(&self, height: u64, hex: String) {
@@ -971,6 +986,7 @@ impl PoolManager {
     pub fn store_pending_tx(&self, txid: &str, tx_hex: &str, scripthashes: Vec<String>, outputs: Vec<PendingTxOutput>) {
         let sh_len = scripthashes.len();
         let out_len = outputs.len();
+        let sh_clone = scripthashes.clone();
         let mut pending = match self.lock_pending() {
             Some(p) => p,
             None => return,
@@ -989,6 +1005,13 @@ impl PoolManager {
             sh_len,
             out_len
         );
+        drop(pending);
+        // Notify connected sessions so they see the new pending tx immediately.
+        for sh in &sh_clone {
+            let _ = self.scripthash_notifications.send(ScripthashNotification {
+                scripthash: sh.clone(),
+            });
+        }
     }
 
     /// Merge additional scripthashes (e.g. input addresses after electrs enrichment).
@@ -1152,14 +1175,27 @@ impl PoolManager {
         total
     }
 
-    pub fn remove_pending_tx(&self, txid: &str) {
-        let mut pending = match self.lock_pending() {
-            Some(p) => p,
-            None => return,
+    pub fn remove_pending_tx(&self, txid: &str) -> Vec<String> {
+        let removed_sh = {
+            let mut pending = match self.lock_pending() {
+                Some(p) => p,
+                None => return Vec::new(),
+            };
+            match pending.remove(txid) {
+                Some(info) => {
+                    tracing::info!("Removed pending tx {}", txid);
+                    info.scripthashes
+                }
+                None => return Vec::new(),
+            }
         };
-        if pending.remove(txid).is_some() {
-            tracing::info!("Removed pending tx {}", txid);
+        // Notify all affected scripthashes so connected Electrum sessions get updated status.
+        for sh in &removed_sh {
+            let _ = self.scripthash_notifications.send(ScripthashNotification {
+                scripthash: sh.clone(),
+            });
         }
+        removed_sh
     }
 
     pub fn get_indexer_url(&self) -> Option<String> {
