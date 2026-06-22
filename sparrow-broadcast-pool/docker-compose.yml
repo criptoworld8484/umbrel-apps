@@ -15,15 +15,14 @@ services:
     command: ["sh", "-c", "mkdir -p /data && chown -R 1000:1000 /data && chmod 755 /data"]
 
   web:
-    image: ghcr.io/criptoworld8484/broadcast-pool-umbrel:0.3.2
+    image: ghcr.io/criptoworld8484/broadcast-pool-umbrel:0.3.4
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
+    network_mode: host
     depends_on:
       init:
         condition: service_completed_successfully
-    ports:
-      - "0.0.0.0:50050:50050/tcp"
     volumes:
       - ${APP_DATA_DIR}/data:/home/app/data
     environment:
