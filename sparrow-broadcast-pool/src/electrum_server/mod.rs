@@ -1984,24 +1984,30 @@ async fn handle_connection(
                         pending::compute_modified_status_hash(vec![], &notification.scripthash, &pending)
                             .unwrap_or_default()
                     };
-                    if !hash.is_empty() || pending.is_empty() {
-                        let notification_json = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "method": "blockchain.scripthash.subscribe",
-                            "params": [notification.scripthash, if hash.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(hash) }]
-                        });
-                        if let Ok(payload) = serde_json::to_vec(&notification_json) {
-                            let mut out = payload;
-                            out.push(b'\n');
-                            if client_stream.write_all(&out).await.is_ok() {
-                                let _ = client_stream.flush().await;
-                                tracing::info!(
-                                    "Push notification for scripthash {} ({} pending) to {}",
-                                    &notification.scripthash[..notification.scripthash.len().min(16)],
-                                    pending.len(),
-                                    peer_addr
-                                );
-                            }
+                    // Always send notification — even with empty pending list — so Sparrow
+                    // learns the tx left the virtual mempool (status hash changes).
+                    let status_value = if pending.is_empty() {
+                        // Empty string = no unconfirmed txs. Sparrow must re-query.
+                        serde_json::Value::String(String::new())
+                    } else {
+                        serde_json::Value::String(hash)
+                    };
+                    let notification_json = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "method": "blockchain.scripthash.subscribe",
+                        "params": [notification.scripthash, status_value]
+                    });
+                    if let Ok(payload) = serde_json::to_vec(&notification_json) {
+                        let mut out = payload;
+                        out.push(b'\n');
+                        if client_stream.write_all(&out).await.is_ok() {
+                            let _ = client_stream.flush().await;
+                            tracing::info!(
+                                "Push notification for scripthash {} ({} pending) to {}",
+                                &notification.scripthash[..notification.scripthash.len().min(16)],
+                                pending.len(),
+                                peer_addr
+                            );
                         }
                     }
                 }
