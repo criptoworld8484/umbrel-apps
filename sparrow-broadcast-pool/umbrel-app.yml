@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.3.6"
+version: "0.3.7"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,6 +31,9 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
+  v0.3.7 — Fix crítico: un deadlock al guardar configuración congelaba el runtime
+  y dejaba a Sparrow en "broadcasting" infinito. Se libera el lock de config antes de reconectar.
+
   v0.3.6 — Fix: en Umbrel, los broadcasts de Sparrow a veces no llegaban al pool.
   El servidor Electrum descartaba las peticiones RPC anteriores al broadcast cuando
   docker-proxy las agrupaba en una sola lectura TCP; ahora se conservan y responden todas.
