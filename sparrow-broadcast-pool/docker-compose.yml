@@ -3,8 +3,8 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      APP_HOST: sparrow-broadcast-pool_web_1
-      APP_PORT: 8080
+      APP_HOST: ${APP_SPARROW_BROADCAST_POOL_IP}
+      APP_PORT: ${APP_SPARROW_BROADCAST_POOL_PORT}
 
   init:
     image: alpine:3.20
@@ -15,7 +15,7 @@ services:
     command: ["sh", "-c", "mkdir -p /data && chown -R 1000:1000 /data && chmod 755 /data"]
 
   web:
-    image: ghcr.io/criptoworld8484/broadcast-pool-umbrel:0.3.5
+    image: ghcr.io/criptoworld8484/broadcast-pool-umbrel:0.3.6
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
@@ -41,3 +41,8 @@ services:
       BROADCAST_POOL_WEB_PORT: "8080"
       BROADCAST_POOL_ELECTRUM_HOST: "0.0.0.0"
       BROADCAST_POOL_ELECTRUM_PORT: "50050"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      default:
+        ipv4_address: ${APP_SPARROW_BROADCAST_POOL_IP}

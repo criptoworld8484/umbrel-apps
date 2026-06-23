@@ -726,10 +726,28 @@ fn pop_client_line(client_buf: &mut Vec<u8>) -> Option<(Vec<u8>, String)> {
         .unwrap_or(0);
     let (s, e) = line_ranges[pick];
     let line_bytes = client_buf[s..e].to_vec();
-    client_buf.drain(..=e);
+    // Drain ONLY the picked line. When the broadcast is not the first buffered
+    // line (pick > 0), `drain(..=e)` would discard every preceding RPC line
+    // unprocessed — Sparrow then never gets responses for those requests. This
+    // only surfaced behind Umbrel's docker-proxy, which coalesces multiple
+    // Sparrow RPC lines into a single read; on a direct LAN connection each
+    // line arrived in its own read so pick was always 0.
+    client_buf.drain(s..=e);
     let line_str = String::from_utf8_lossy(&line_bytes)
         .trim_end_matches('\r')
         .to_string();
+    // Debug: log unique RPC methods seen
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line_str) {
+        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("?");
+        if method != "blockchain.scripthash.subscribe"
+            && method != "blockchain.estimatefee"
+            && method != "mempool.get_fee_histogram"
+            && method != "server.ping"
+            && method != "blockchain.scripthash.get_history"
+        {
+            tracing::info!("RAW RPC method={} len={}", method, line_str.len());
+        }
+    }
     Some((line_bytes, line_str))
 }
 
@@ -2391,6 +2409,34 @@ mod tests {
         assert_eq!(
             parse_headers_subscribe_result(&ok),
             Some((100, "deadbeef".to_string()))
+        );
+    }
+
+    #[test]
+    fn pop_client_line_preserves_lines_before_broadcast() {
+        // Through Umbrel's docker-proxy, Sparrow's RPC lines coalesce into one read:
+        // a scripthash.subscribe arrives in the same buffer as the broadcast.
+        let subscribe = r#"{"jsonrpc":"2.0","method":"blockchain.scripthash.subscribe","params":["aa"],"id":1}"#;
+        let broadcast = format!(
+            r#"{{"jsonrpc":"2.0","method":"blockchain.transaction.broadcast","params":["{}"],"id":2}}"#,
+            SAMPLE_TX
+        );
+        let mut buf = Vec::new();
+        buf.extend_from_slice(subscribe.as_bytes());
+        buf.push(b'\n');
+        buf.extend_from_slice(broadcast.as_bytes());
+        buf.push(b'\n');
+
+        // First pop prioritizes the broadcast line (intended behavior).
+        let (_, first) = pop_client_line(&mut buf).expect("broadcast popped first");
+        assert!(line_looks_like_broadcast(&first), "broadcast should be served first");
+
+        // Second pop MUST still return the subscribe line — it must not be discarded.
+        let (_, second) = pop_client_line(&mut buf).expect("subscribe line must survive");
+        assert!(
+            second.contains("blockchain.scripthash.subscribe"),
+            "preceding subscribe line was dropped: {:?}",
+            second
         );
     }
 
