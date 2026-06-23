@@ -967,20 +967,28 @@ fn pending_txids_for_scripthash_with_session(
 ) -> Vec<String> {
     if let Some(session) = session {
         if let Some(ref txid) = session.recent_broadcast_txid {
-            // Sparrow polls INPUT scripthashes right after ack — always include pending broadcast.
-            let mut pending = vec![txid.clone()];
-            for t in pool_manager.get_pending_txids_for_scripthash(scripthash) {
-                if !pending.iter().any(|p| p == &t) {
-                    pending.push(t);
+            // Only include recent_broadcast_txid if it's still in the virtual mempool.
+            // Once broadcast to Bitcoin Core and removed, Sparrow sees the real state.
+            if pool_manager.has_pending_tx(txid) {
+                let mut pending = vec![txid.clone()];
+                for t in pool_manager.get_pending_txids_for_scripthash(scripthash) {
+                    if !pending.iter().any(|p| p == &t) {
+                        pending.push(t);
+                    }
                 }
+                tracing::info!(
+                    "Session broadcast poll {} → tx {} ({} total)",
+                    &scripthash[..scripthash.len().min(16)],
+                    &txid[..txid.len().min(16)],
+                    pending.len()
+                );
+                return pending;
+            } else {
+                tracing::info!(
+                    "Skipping stale recent_broadcast_txid {} (no longer in virtual mempool)",
+                    &txid[..txid.len().min(16)]
+                );
             }
-            tracing::info!(
-                "Session broadcast poll {} → tx {} ({} total)",
-                &scripthash[..scripthash.len().min(16)],
-                &txid[..txid.len().min(16)],
-                pending.len()
-            );
-            return pending;
         }
     }
     pending_txids_for_scripthash(pool_manager, scripthash)
@@ -1949,6 +1957,16 @@ async fn handle_connection(
                 }
             }
             Ok(notification) = scripthash_rx.recv() => {
+                // Clear stale recent_broadcast_txid if the tx was already broadcast.
+                if let Some(ref txid) = session.recent_broadcast_txid {
+                    if !pool_manager.has_pending_tx(txid) {
+                        tracing::info!(
+                            "Clearing stale recent_broadcast_txid {} (broadcast to network)",
+                            &txid[..txid.len().min(16)]
+                        );
+                        session.recent_broadcast_txid = None;
+                    }
+                }
                 if session.subscribed_scripthashes.contains(&notification.scripthash) {
                     let indexer_url = resolve_live_indexer_url(&pool_manager, &config);
                     let pending = pending_txids_for_scripthash_with_session(
@@ -1957,11 +1975,20 @@ async fn handle_connection(
                         &indexer_url,
                         Some(&session),
                     );
-                    if let Some(hash) = pending::compute_modified_status_hash(vec![], &notification.scripthash, &pending) {
+                    // Always send notification — even with empty pending list — so Sparrow
+                    // learns the tx left the virtual mempool (status hash changes).
+                    let hash = if pending.is_empty() {
+                        // Empty status hash = no unconfirmed txs for this scripthash.
+                        String::new()
+                    } else {
+                        pending::compute_modified_status_hash(vec![], &notification.scripthash, &pending)
+                            .unwrap_or_default()
+                    };
+                    if !hash.is_empty() || pending.is_empty() {
                         let notification_json = serde_json::json!({
                             "jsonrpc": "2.0",
                             "method": "blockchain.scripthash.subscribe",
-                            "params": [notification.scripthash, hash]
+                            "params": [notification.scripthash, if hash.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(hash) }]
                         });
                         if let Ok(payload) = serde_json::to_vec(&notification_json) {
                             let mut out = payload;
