@@ -1569,6 +1569,7 @@ fn set_tcp_keepalive(stream: &std::net::TcpStream) {
         .with_time(std::time::Duration::from_secs(60))
         .with_interval(std::time::Duration::from_secs(10));
     let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&keepalive);
+    let _ = stream.set_nodelay(true);
 }
 
 fn run_electrum_accept_thread(
@@ -1905,6 +1906,8 @@ async fn handle_connection(
     let mut client_buf = Vec::new();
     let mut session = SessionState::new();
     let mut scripthash_rx = pool_manager.subscribe_scripthash_changes();
+
+    client_stream.set_nodelay(true)?;
 
     loop {
         tokio::select! {
