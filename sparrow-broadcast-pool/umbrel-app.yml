@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.3.10"
+version: "0.3.11"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,6 +31,9 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
+  v0.3.11 — Fix: Liana fallaba con "Genesis hash mismatch" al configurar. Ahora se
+  reporta el genesis real del nodo (soporta signets personalizados).
+
   v0.3.10 — Importacion respeta la red configurada (no fija signet) y aviso de
   seguridad al arrancar en mainnet (las tx retenidas no se difunden hasta el trigger).
 
