@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.3.18"
+version: "0.3.20"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,38 +31,13 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
-  v0.3.18 — Las transacciones programadas se siguen difundiendo aunque el indexador
-  (electrs/Fulcrum) se caiga: el scheduler lee la altura de bloque y el tiempo mediano (MTP)
-  directamente de Bitcoin Core cuando el indexador no responde, en lugar de quedarse parado.
-  El dashboard indica qué indexador está caído, en qué IP:puerto, y si las programaciones
-  siguen en marcha o están en pausa.
+  v0.3.20 — Las transacciones importadas ahora se muestran como un tipo "Importada" diferenciado en el dashboard y pueden programarse por fecha/hora o por precio, igual que las manuales. Se elimina el indexador externo/secundario de la interfaz y la configuración; el indexador principal y la copia de seguridad de Bitcoin Core se mantienen.
 
-  v0.3.16 — Detección de red robusta: reintenta hasta que el RPC de Bitcoin Core esté
-  listo (en mainnet el arranque tarda más), evitando que el panel muestre testnet4 por error.
+  v0.3.19 — Tercer nivel de resiliencia y ciclado de UTXO de Liana. Si el indexador principal Y Bitcoin Core fallan, las programaciones pueden seguir cumpliéndose con un indexador secundario configurable en tu red. Nueva opción de "bloque virtual" para el ciclado de UTXO de Liana (altura de bloque virtual configurable). Dashboard: tabla de transacciones con el origen (Sparrow/Liana) coloreado, columna TXID unificada (enlace + copiar), toggle deslizante y favicon.
 
-  v0.3.15 — Conexión a indexador por hostname (electrs/Fulcrum), genesis real del nodo,
-  URL de wallet correcta, y detección de Liana en el mismo puerto que Sparrow para
-  programar sus tx por fecha/hora. Incluye los fixes previos del cuelgue de Sparrow.
+  v0.3.18 — Las transacciones programadas se siguen difundiendo aunque el indexador (electrs/Fulcrum) se caiga.
 
-  v0.3.11 — Fix: Liana fallaba con "Genesis hash mismatch" al configurar. Ahora se
-  reporta el genesis real del nodo (soporta signets personalizados).
-
-  v0.3.10 — Importacion respeta la red configurada (no fija signet) y aviso de
-  seguridad al arrancar en mainnet (las tx retenidas no se difunden hasta el trigger).
-
-  v0.3.9 — Fix: Sparrow se quedaba en "broadcasting" porque la tx pendiente se
-  inyectaba en todas las direcciones consultadas. Ahora se inyecta solo en las
-  direcciones reales de la tx (inputs/outputs).
-
-  v0.3.8 — Fix: Sparrow quedaba en "broadcasting" infinito aunque la tx ya estaba en
-  la mempool virtual. Ahora se notifican las direcciones de gasto (input) tras resolverlas.
-
-  v0.3.7 — Fix crítico: un deadlock al guardar configuración congelaba el runtime
-  y dejaba a Sparrow en "broadcasting" infinito. Se libera el lock de config antes de reconectar.
-
-  v0.3.6 — Fix: en Umbrel, los broadcasts de Sparrow a veces no llegaban al pool.
-  El servidor Electrum descartaba las peticiones RPC anteriores al broadcast cuando
-  docker-proxy las agrupaba en una sola lectura TCP; ahora se conservan y responden todas.
+  El scheduler lee ahora la altura de bloque y el tiempo mediano (MTP) directamente de Bitcoin Core cuando el indexador no responde, en lugar de quedarse parado. El dashboard indica qué indexador está caído, en qué IP:puerto, y si las programaciones siguen en marcha o están en pausa.
 
   v0.3.2 — Fix Sparrow connect hang (accept thread + no sync I/O on tokio workers).
 
