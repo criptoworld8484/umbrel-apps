@@ -2,7 +2,7 @@ manifestVersion: 1
 id: sparrow-broadcast-pool
 category: bitcoin
 name: Broadcast Pool
-version: "0.3.20"
+version: "0.3.21"
 tagline: Programa y difunde transacciones Bitcoin desde Sparrow con privacidad
 icon: https://raw.githubusercontent.com/criptoworld8484/umbrel-apps/master/sparrow-broadcast-pool/icon.png
 description: >-
@@ -31,6 +31,8 @@ description: >-
 
   Configura Sparrow con la URL Electrum que muestra el dashboard (puerto 50050).
 releaseNotes: >-
+  v0.3.21 — Cifrado en reposo de los datos sensibles del pool (tx firmadas, direcciones) con detección de manipulación: si se altera una fila de la base de datos, se activa un "modo seguro" que detiene la difusión hasta que lo revises. Nuevo archivo histórico cifrado con contraseña propia: las transacciones terminadas se pueden volcar manualmente ("Archivar ahora") o automáticamente a los 30 días, y solo se consultan introduciendo la contraseña. La contraseña RPC de Bitcoin Core también se guarda cifrada. Además, el valor del pool se muestra ahora en sats.
+
   v0.3.20 — Las transacciones importadas ahora se muestran como un tipo "Importada" diferenciado en el dashboard y pueden programarse por fecha/hora o por precio, igual que las manuales. Se elimina el indexador externo/secundario de la interfaz y la configuración; el indexador principal y la copia de seguridad de Bitcoin Core se mantienen.
 
   v0.3.19 — Tercer nivel de resiliencia y ciclado de UTXO de Liana. Si el indexador principal Y Bitcoin Core fallan, las programaciones pueden seguir cumpliéndose con un indexador secundario configurable en tu red. Nueva opción de "bloque virtual" para el ciclado de UTXO de Liana (altura de bloque virtual configurable). Dashboard: tabla de transacciones con el origen (Sparrow/Liana) coloreado, columna TXID unificada (enlace + copiar), toggle deslizante y favicon.
